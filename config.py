@@ -92,6 +92,7 @@ class ModelConfig:
     # Параметры LSTM
     LSTM_UNITS = [128, 64, 32]
     LSTM_DROPOUT = 0.2
+    LSTM_LEARNING_RATE = 0.001  # Добавлено
     LSTM_EPOCHS = 100
     LSTM_BATCH_SIZE = 32
     LSTM_PATIENCE = 10
@@ -99,8 +100,10 @@ class ModelConfig:
     # Параметры XGBoost
     XGB_MAX_DEPTH = 6
     XGB_LEARNING_RATE = 0.01
-    XGB_N_ESTIMATORS = 500
+    XGB_N_ESTIMATORS = 100
     XGB_EARLY_STOPPING_ROUNDS = 50
+    XGB_SUBSAMPLE = 0.8  # Добавлено
+    XGB_COLSAMPLE_BYTREE = 0.8  # Добавлено
 
     # Общие параметры
     TRAIN_TEST_SPLIT = 0.8
@@ -112,12 +115,15 @@ class ModelConfig:
     TARGET_THRESHOLD_DOWN = -0.005  # -0.5% для SHORT
     USE_DYNAMIC_THRESHOLDS = True  # Использовать динамические пороги на основе волатильности
 
+    # Новые параметры
+    RETRAIN_DAYS = 7  # Период переобучения моделей
+
 
 @dataclass
 class DataConfig:
     """Конфигурация данных"""
     # Периоды (по умолчанию)
-    TRAINING_PERIOD_DAYS = 365 * 2  # 2 года для обучения
+    TRAINING_PERIOD_DAYS = 730  # 2 года для обучения
     BACKTEST_PERIOD_DAYS = 30  # 30 дней для бэктеста
     UPDATE_INTERVAL_HOURS = 1  # Обновление данных каждые N часов
     DEFAULT_UPDATE_DAYS = 120  # По умолчанию загружаем 120 дней
@@ -159,6 +165,10 @@ class BacktestConfig:
     @TRADE_FEE.setter
     def TRADE_FEE(self, value: float):
         self._trade_fee = value
+
+    @property
+    def COMMISSION(self) -> float:
+        return self._trade_fee  # Алиас для обратной совместимости
 
     @property
     def SLIPPAGE(self) -> float:

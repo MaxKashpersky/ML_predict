@@ -6,8 +6,9 @@ import sqlite3
 import pandas as pd
 import logging
 import json
+import os
 from datetime import datetime, timedelta
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Tuple, List
 from config import config
 
 
@@ -16,7 +17,8 @@ class Database:
         """Инициализация базы данных"""
         self.verbose = verbose
         self.setup_logging()
-        self.conn = None
+        self.connection = None
+        self.cursor = None
         self.connect()
         self.init_tables()
 
@@ -41,19 +43,24 @@ class Database:
     def connect(self):
         """Подключение к базе данных"""
         try:
-            self.conn = sqlite3.connect(config.DB_PATH)
-            self.conn.row_factory = sqlite3.Row
+            # Создаем директорию для базы данных если ее нет
+            db_dir = os.path.dirname(config.DB_PATH)
+            if db_dir and not os.path.exists(db_dir):
+                os.makedirs(db_dir)
+
+            self.connection = sqlite3.connect(config.DB_PATH)
+            self.connection.row_factory = sqlite3.Row
+            self.cursor = self.connection.cursor()
             self.log("Database connection established")
         except Exception as e:
             self.log(f"Error connecting to database: {str(e)}", 'error')
+            raise
 
     def init_tables(self):
         """Инициализация таблиц"""
         try:
-            cursor = self.conn.cursor()
-
             # Таблица для хранения исторических данных
-            cursor.execute('''
+            self.cursor.execute('''
                 CREATE TABLE IF NOT EXISTS historical_data (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     symbol TEXT NOT NULL,
@@ -69,7 +76,7 @@ class Database:
             ''')
 
             # Таблица для метаданных (последнее обновление)
-            cursor.execute('''
+            self.cursor.execute('''
                 CREATE TABLE IF NOT EXISTS metadata (
                     symbol TEXT NOT NULL,
                     timeframe TEXT NOT NULL,
@@ -80,7 +87,7 @@ class Database:
             ''')
 
             # Таблица для моделей
-            cursor.execute('''
+            self.cursor.execute('''
                 CREATE TABLE IF NOT EXISTS models (
                     model_id TEXT PRIMARY KEY,
                     symbol TEXT NOT NULL,
@@ -90,12 +97,13 @@ class Database:
                     parameters TEXT,
                     metrics TEXT,
                     model_path TEXT NOT NULL,
+                    feature_importance TEXT,
                     is_active BOOLEAN DEFAULT 1
                 )
             ''')
 
             # Таблица для результатов бэктеста
-            cursor.execute('''
+            self.cursor.execute('''
                 CREATE TABLE IF NOT EXISTS backtest_results (
                     test_id INTEGER PRIMARY KEY AUTOINCREMENT,
                     model_id TEXT NOT NULL,
@@ -121,73 +129,86 @@ class Database:
             ''')
 
             # Индексы для оптимизации
-            cursor.execute(
+            self.cursor.execute(
                 'CREATE INDEX IF NOT EXISTS idx_historical_data ON historical_data(symbol, timeframe, timestamp)')
-            cursor.execute('CREATE INDEX IF NOT EXISTS idx_models ON models(symbol, timeframe, is_active)')
+            self.cursor.execute('CREATE INDEX IF NOT EXISTS idx_models ON models(symbol, timeframe, is_active)')
+            self.cursor.execute('CREATE INDEX IF NOT EXISTS idx_backtest ON backtest_results(model_id, symbol)')
 
-            self.conn.commit()
+            self.connection.commit()
             self.log("Database tables initialized")
 
         except Exception as e:
             self.log(f"Error initializing tables: {str(e)}", 'error')
+            raise
 
-    def store_historical_data(self, symbol: str, timeframe: str, data: pd.DataFrame, verbose: bool = True):
+    def store_historical_data(self, symbol: str, timeframe: str, data: pd.DataFrame, verbose: bool = True) -> bool:
         """
         Сохранение исторических данных в базу
+        Возвращает True если сохранение успешно
         """
         try:
             if data.empty:
                 self.log(f"No data to save for {symbol} {timeframe}", 'warning')
-                return
+                return False
 
-            cursor = self.conn.cursor()
-            added_count = 0
-            updated_count = 0
+            # Создаем копию данных
+            df = data.copy()
+            df.reset_index(inplace=True)
+            df.rename(columns={'index': 'timestamp'}, inplace=True)
 
-            for idx, row in data.iterrows():
-                try:
-                    timestamp_str = idx.strftime('%Y-%m-%d %H:%M:%S') if hasattr(idx, 'strftime') else str(idx)
+            # Убедимся, что timestamp в правильном формате
+            if 'timestamp' in df.columns:
+                df['timestamp'] = pd.to_datetime(df['timestamp']).dt.strftime('%Y-%m-%d %H:%M:%S')
 
-                    cursor.execute('''
-                        INSERT OR IGNORE INTO historical_data 
-                        (symbol, timeframe, timestamp, open, high, low, close, volume)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    ''', (symbol, timeframe, timestamp_str, row['open'], row['high'],
-                          row['low'], row['close'], row['volume']))
+            # Добавляем символ и таймфрейм
+            df['symbol'] = symbol
+            df['timeframe'] = timeframe
 
-                    if cursor.rowcount > 0:
-                        added_count += 1
-                    else:
-                        cursor.execute('''
-                            UPDATE historical_data 
-                            SET open=?, high=?, low=?, close=?, volume=?
-                            WHERE symbol=? AND timeframe=? AND timestamp=?
-                        ''', (row['open'], row['high'], row['low'],
-                              row['close'], row['volume'], symbol, timeframe, timestamp_str))
-                        updated_count += 1
+            # Проверяем наличие необходимых колонок
+            required_columns = ['open', 'high', 'low', 'close', 'volume']
+            for col in required_columns:
+                if col not in df.columns:
+                    self.log(f"Missing required column: {col}", 'error')
+                    return False
 
-                except Exception as e:
-                    if verbose:
-                        self.log(f"Error saving data: {str(e)}", 'error')
-                    continue
+            # Подготавливаем данные для вставки
+            records = df[['symbol', 'timeframe', 'timestamp', 'open', 'high', 'low', 'close', 'volume']].to_dict('records')
+
+            if not records:
+                self.log("No records to save", 'warning')
+                return False
+
+            # Используем bulk insert
+            query = """
+            INSERT OR REPLACE INTO historical_data 
+            (symbol, timeframe, timestamp, open, high, low, close, volume)
+            VALUES (:symbol, :timeframe, :timestamp, :open, :high, :low, :close, :volume)
+            """
+
+            self.cursor.executemany(query, records)
 
             # Обновление метаданных
             last_timestamp = data.index.max()
             last_timestamp_str = last_timestamp.strftime('%Y-%m-%d %H:%M:%S')
 
-            cursor.execute('''
+            self.cursor.execute('''
                 INSERT OR REPLACE INTO metadata (symbol, timeframe, last_update, last_candle_timestamp)
                 VALUES (?, ?, ?, ?)
             ''', (symbol, timeframe, datetime.now().strftime('%Y-%m-%d %H:%M:%S'), last_timestamp_str))
 
-            self.conn.commit()
+            self.connection.commit()
 
+            added_count = len(records)
             if verbose:
-                self.log(
-                    f"Data saved: added {added_count}, updated {updated_count} records")
+                print(f"✅ Данные сохранены: {added_count} записей")
+                self.log(f"Data saved: {added_count} records for {symbol} {timeframe}")
+
+            return True
 
         except Exception as e:
             self.log(f"Error saving data: {str(e)}", 'error')
+            print(f"❌ Ошибка сохранения данных: {e}")
+            return False
 
     def get_historical_data(self, symbol: str, timeframe: str,
                             start_date: Optional[datetime] = None,
@@ -211,17 +232,18 @@ class Database:
                 query += ' AND timestamp <= ?'
                 params.append(end_date.strftime('%Y-%m-%d %H:%M:%S'))
 
-            query += ' ORDER BY timestamp'
+            query += ' ORDER BY timestamp ASC'
 
-            df = pd.read_sql_query(query, self.conn, params=params, parse_dates=['timestamp'])
+            df = pd.read_sql_query(query, self.connection, params=params)
 
             if not df.empty:
+                df['timestamp'] = pd.to_datetime(df['timestamp'])
                 df.set_index('timestamp', inplace=True)
                 if verbose:
-                    self.log(f"Retrieved {len(df)} records")
+                    self.log(f"Retrieved {len(df)} records for {symbol} {timeframe}")
             else:
                 if verbose:
-                    self.log(f"No data found", 'warning')
+                    self.log(f"No data found for {symbol} {timeframe}", 'warning')
 
             return df
 
@@ -232,13 +254,12 @@ class Database:
     def get_last_timestamp(self, symbol: str, timeframe: str, verbose: bool = True) -> Optional[datetime]:
         """Получение времени последней свечи"""
         try:
-            cursor = self.conn.cursor()
-            cursor.execute('''
+            self.cursor.execute('''
                 SELECT last_candle_timestamp FROM metadata 
                 WHERE symbol = ? AND timeframe = ?
             ''', (symbol, timeframe))
 
-            result = cursor.fetchone()
+            result = self.cursor.fetchone()
             if result and result[0]:
                 last_timestamp = pd.to_datetime(result[0])
                 if verbose:
@@ -253,25 +274,30 @@ class Database:
 
     def save_model_info(self, model_id: str, symbol: str, timeframe: str,
                         model_type: str, parameters: str, metrics: str,
-                        model_path: str, verbose: bool = True):
+                        model_path: str, feature_importance: Optional[str] = None,
+                        verbose: bool = True) -> bool:
         """Сохранение информации о модели"""
         try:
-            cursor = self.conn.cursor()
-            cursor.execute('''
+            self.cursor.execute('''
                 INSERT OR REPLACE INTO models 
                 (model_id, symbol, timeframe, model_type, created_at, 
-                 parameters, metrics, model_path, is_active)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 parameters, metrics, model_path, feature_importance, is_active)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (model_id, symbol, timeframe, model_type, datetime.now(),
-                  parameters, metrics, model_path, 1))
+                  parameters, metrics, model_path, feature_importance, 1))
 
-            self.conn.commit()
+            self.connection.commit()
             if verbose:
-                self.log(f"Model info saved")
+                self.log(f"Model info saved for {model_id}")
+                print(f"✅ Информация о модели сохранена в базу")
+
+            return True
 
         except Exception as e:
             if verbose:
                 self.log(f"Error saving model info: {str(e)}", 'error')
+                print(f"❌ Ошибка сохранения информации о модели: {e}")
+            return False
 
     def get_available_models(self, symbol: Optional[str] = None,
                              timeframe: Optional[str] = None,
@@ -304,10 +330,16 @@ class Database:
 
             query += ' ORDER BY created_at DESC'
 
-            df = pd.read_sql_query(query, self.conn, params=params, parse_dates=['created_at'])
+            df = pd.read_sql_query(query, self.connection, params=params)
+
+            # Парсим даты если есть колонка created_at
+            if 'created_at' in df.columns and not df.empty:
+                df['created_at'] = pd.to_datetime(df['created_at'])
 
             if verbose:
                 self.log(f"Found {len(df)} models")
+                if len(df) > 0:
+                    print(f"📊 Найдено моделей: {len(df)}")
 
             return df
 
@@ -316,23 +348,27 @@ class Database:
                 self.log(f"Error getting models: {str(e)}", 'error')
             return pd.DataFrame()
 
-    def save_backtest_result(self, result_data: Dict, verbose: bool = True):
+    def save_backtest_result(self, result_data: Dict, verbose: bool = True) -> bool:
         """Сохранение результата бэктеста в БД"""
         try:
-            cursor = self.conn.cursor()
             columns = ', '.join(result_data.keys())
             placeholders = ', '.join(['?'] * len(result_data))
 
             query = f'INSERT INTO backtest_results ({columns}) VALUES ({placeholders})'
-            cursor.execute(query, list(result_data.values()))
+            self.cursor.execute(query, list(result_data.values()))
 
-            self.conn.commit()
+            self.connection.commit()
             if verbose:
                 self.log(f"Backtest result saved")
+                print(f"✅ Результат бэктеста сохранен")
+
+            return True
 
         except Exception as e:
             if verbose:
                 self.log(f"Error saving backtest result: {str(e)}", 'error')
+                print(f"❌ Ошибка сохранения результата бэктеста: {e}")
+            return False
 
     def get_backtest_results(self, model_id: Optional[str] = None,
                              symbol: Optional[str] = None,
@@ -358,7 +394,13 @@ class Database:
             query += ' ORDER BY test_date DESC LIMIT ?'
             params.append(limit)
 
-            df = pd.read_sql_query(query, self.conn, params=params, parse_dates=['test_date', 'start_date', 'end_date'])
+            df = pd.read_sql_query(query, self.connection, params=params)
+
+            # Парсим даты
+            date_columns = ['test_date', 'start_date', 'end_date']
+            for col in date_columns:
+                if col in df.columns:
+                    df[col] = pd.to_datetime(df[col])
 
             if verbose:
                 self.log(f"Retrieved {len(df)} backtest results")
@@ -373,29 +415,30 @@ class Database:
     def delete_model(self, model_id: str, verbose: bool = True) -> bool:
         """Удаление модели из базы данных"""
         try:
-            cursor = self.conn.cursor()
-
             # Проверяем существование модели
-            cursor.execute('SELECT model_id FROM models WHERE model_id = ?', (model_id,))
-            if not cursor.fetchone():
+            self.cursor.execute('SELECT model_id FROM models WHERE model_id = ?', (model_id,))
+            if not self.cursor.fetchone():
                 if verbose:
                     self.log(f"Model {model_id} not found", 'warning')
+                    print(f"❌ Модель {model_id} не найдена")
                 return False
 
             # Удаляем модель
-            cursor.execute('DELETE FROM models WHERE model_id = ?', (model_id,))
-            self.conn.commit()
+            self.cursor.execute('DELETE FROM models WHERE model_id = ?', (model_id,))
+            self.connection.commit()
 
-            deleted_rows = cursor.rowcount
+            deleted_rows = self.cursor.rowcount
 
             if verbose:
                 self.log(f"Model {model_id} deleted. Rows affected: {deleted_rows}")
+                print(f"✅ Модель {model_id} удалена")
 
             return deleted_rows > 0
 
         except Exception as e:
             if verbose:
                 self.log(f"Error deleting model {model_id}: {str(e)}", 'error')
+                print(f"❌ Ошибка удаления модели {model_id}: {e}")
             return False
 
     def delete_all_models(self, symbol: Optional[str] = None,
@@ -403,8 +446,6 @@ class Database:
                           verbose: bool = True) -> int:
         """Удаление всех моделей или по фильтру"""
         try:
-            cursor = self.conn.cursor()
-
             query = 'DELETE FROM models'
             conditions = []
             params = []
@@ -421,23 +462,103 @@ class Database:
                 query += ' WHERE ' + ' AND '.join(conditions)
 
             # Выполняем удаление
-            cursor.execute(query, params)
-            self.conn.commit()
+            self.cursor.execute(query, params)
+            self.connection.commit()
 
-            deleted_rows = cursor.rowcount
+            deleted_rows = self.cursor.rowcount
 
             if verbose:
                 self.log(f"Deleted {deleted_rows} models")
+                print(f"✅ Удалено моделей: {deleted_rows}")
 
             return deleted_rows
 
         except Exception as e:
             if verbose:
                 self.log(f"Error deleting models: {str(e)}", 'error')
+                print(f"❌ Ошибка удаления моделей: {e}")
             return 0
+
+    def update_model_state(self, model_id: str, is_active: bool, verbose: bool = True) -> bool:
+        """Обновление состояния модели (активна/неактивна)"""
+        try:
+            self.cursor.execute('''
+                UPDATE models 
+                SET is_active = ? 
+                WHERE model_id = ?
+            ''', (1 if is_active else 0, model_id))
+
+            self.connection.commit()
+
+            updated_rows = self.cursor.rowcount
+
+            if verbose:
+                status = "активирована" if is_active else "деактивирована"
+                self.log(f"Model {model_id} {status}")
+                print(f"✅ Модель {model_id} {status}")
+
+            return updated_rows > 0
+
+        except Exception as e:
+            if verbose:
+                self.log(f"Error updating model state: {str(e)}", 'error')
+                print(f"❌ Ошибка обновления состояния модели: {e}")
+            return False
+
+    def get_model_state(self, model_id: str) -> Optional[bool]:
+        """Получение текущего состояния модели"""
+        try:
+            self.cursor.execute('SELECT is_active FROM models WHERE model_id = ?', (model_id,))
+            result = self.cursor.fetchone()
+
+            if result:
+                return bool(result[0])
+            return None
+
+        except Exception as e:
+            self.log(f"Error getting model state: {str(e)}", 'error')
+            return None
+
+    def get_system_stats(self) -> Dict[str, Any]:
+        """Получение статистики системы"""
+        try:
+            stats = {}
+
+            # Количество моделей
+            self.cursor.execute('SELECT COUNT(*) FROM models')
+            stats['total_models'] = self.cursor.fetchone()[0]
+
+            self.cursor.execute('SELECT COUNT(*) FROM models WHERE is_active = 1')
+            stats['active_models'] = self.cursor.fetchone()[0]
+
+            # Количество записей данных
+            self.cursor.execute('SELECT COUNT(*) FROM historical_data')
+            stats['total_data_records'] = self.cursor.fetchone()[0]
+
+            # Размер базы данных
+            import os
+            if os.path.exists(config.DB_PATH):
+                stats['db_size_mb'] = os.path.getsize(config.DB_PATH) / (1024 * 1024)
+            else:
+                stats['db_size_mb'] = 0
+
+            return stats
+
+        except Exception as e:
+            self.log(f"Error getting system stats: {str(e)}", 'error')
+            return {}
+
+    def test_connection(self) -> bool:
+        """Тестирование подключения к базе данных"""
+        try:
+            self.cursor.execute('SELECT 1')
+            result = self.cursor.fetchone()
+            return result is not None and result[0] == 1
+        except:
+            return False
 
     def close(self):
         """Закрытие соединения с базой данных"""
-        if self.conn:
-            self.conn.close()
+        if self.connection:
+            self.connection.close()
             self.log("Database connection closed")

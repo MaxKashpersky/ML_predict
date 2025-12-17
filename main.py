@@ -499,17 +499,26 @@ class TradingBot:
                 )
                 if not models_df.empty:
                     print("\n📋 ДОСТУПНЫЕ МОДЕЛИ:")
-                    for i, (_, row) in enumerate(models_df.iterrows()):
-                        print(f"   {i+1}. {row['model_type']} ({row['created_at'][:10]})")
+                    for i, (_, row) in enumerate(models_df.iterrows(), 1):
+                        # Безопасное извлечение даты
+                        created_date = row['created_at']
+                        if hasattr(created_date, 'strftime'):
+                            date_str = created_date.strftime('%Y-%m-%d')
+                        elif isinstance(created_date, str):
+                            date_str = created_date[:10]
+                        else:
+                            date_str = str(created_date)[:10] if len(str(created_date)) >= 10 else str(created_date)
+
+                        print(f"   {i}. {row['model_type']} - {date_str}")
 
                     model_idx = input(f"\nВыберите модель (1-{len(models_df)}): ").strip()
                     if model_idx.isdigit() and 1 <= int(model_idx) <= len(models_df):
-                        model_id = models_df.iloc[int(model_idx)-1]['model_id']
+                        model_id = models_df.iloc[int(model_idx) - 1]['model_id']
                         print(f"✅ Выбрана модель: {model_id}")
                     else:
                         print("⚠️  Неверный выбор, будет использована лучшая модель")
                 else:
-                    print("⚠️  Нет доступных моделей, будет обучена новая")
+                    print("⚠️  Нет доступных моделей, будет использована лучшая модель")
 
             # Настройки бэктеста
             print("\n⚙️  НАСТРОЙКИ БЭКТЕСТА:")
@@ -523,19 +532,19 @@ class TradingBot:
             else:
                 initial_balance = config.backtest.INITIAL_BALANCE
 
-            commission = input(f"Комиссия в % (по умолчанию {config.backtest.COMMISSION*100}): ").strip()
+            commission = input(f"Комиссия в % (по умолчанию {config.trading.COMMISSION * 100}): ").strip()
             if commission:
                 try:
                     commission = float(commission) / 100
                 except:
-                    commission = config.backtest.COMMISSION
-                    print(f"⚠️  Ошибка ввода, используется {commission*100}%")
+                    commission = config.trading.COMMISSION
+                    print(f"⚠️  Ошибка ввода, используется {commission * 100}%")
             else:
-                commission = config.backtest.COMMISSION
+                commission = config.trading.COMMISSION
 
             print(f"\n⚙️  ПАРАМЕТРЫ БЭКТЕСТА:")
             print(f"   Начальный баланс: ${initial_balance:,.2f}")
-            print(f"   Комиссия: {commission*100:.2f}%")
+            print(f"   Комиссия: {commission * 100:.2f}%")
             print(f"   Плечо: 1x (без маржинальной торговли)")
 
             confirm = input("\n🚀 Запустить бэктест? (y/n): ")
@@ -548,7 +557,7 @@ class TradingBot:
                 symbol=self.selected_symbol,
                 initial_balance=initial_balance,
                 commission=commission,
-                model_id=model_id if model_id else None,
+                model_id=model_id,
                 verbose=True
             )
 

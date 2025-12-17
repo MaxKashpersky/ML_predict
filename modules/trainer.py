@@ -9,7 +9,7 @@ import json
 import os
 import pickle
 import hashlib
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, Tuple, Optional, Any, List
 from config import config
 from modules.database import Database
@@ -83,33 +83,35 @@ class ModelTrainer:
 
             print(f"   🔍 Проверка данных для обучения {symbol} ({timeframe})...")
 
-            # Получаем даты для обучения
-            end_date = datetime.now()
-            start_date = end_date - pd.Timedelta(days=training_days)
+            # Получаем даты для обучения из state_manager
+            train_start, train_end = state_manager.get_training_dates()
+            days_back = max(training_days, (train_end - train_start).days)
+
+            print(f"   📅 Проверка данных за последние {days_back} дней...")
 
             # Проверяем наличие данных в базе
             existing_data = self.db.get_historical_data(
                 symbol=symbol,
                 timeframe=timeframe,
-                start_date=start_date,
-                end_date=end_date,
+                start_date=train_start,
+                end_date=train_end,
                 verbose=False
             )
 
-            min_samples_needed = config.model.LOOKBACK_WINDOW * 5  # Минимум 5 последовательностей
+            min_samples_needed = config.model.LOOKBACK_WINDOW * 10  # Минимум 10 последовательностей
             if len(existing_data) >= min_samples_needed:
                 print(f"   ✅ Данные уже есть: {len(existing_data)} свечей")
                 return True
 
             print(f"   ⚠️  Недостаточно данных: {len(existing_data)} из {min_samples_needed} нужных")
-            print(f"   📥 Загрузка данных с {start_date.date()} по {end_date.date()}...")
+            print(f"   📥 Загрузка данных...")
 
             # Загружаем данные
             data_fetcher = DataFetcher()
             data = data_fetcher.fetch_historical_data(
                 symbol=symbol,
                 timeframe=timeframe,
-                days_back=training_days
+                days_back=days_back
             )
 
             if data.empty:
@@ -121,7 +123,7 @@ class ModelTrainer:
                 symbol=symbol,
                 timeframe=timeframe,
                 data=data,
-                verbose=False
+                verbose=True
             )
 
             if success:
@@ -133,6 +135,8 @@ class ModelTrainer:
 
         except Exception as e:
             print(f"   ❌ Ошибка проверки данных: {e}")
+            import traceback
+            traceback.print_exc()
             return False
 
     def prepare_training_data(self, symbol: str, timeframe: str,
@@ -225,7 +229,7 @@ class ModelTrainer:
                 target_column=target_column,
                 lookback_window=config.model.LOOKBACK_WINDOW,
                 use_advanced_features=use_advanced_features,
-                verbose=verbose  # Добавляем этот параметр
+                verbose=verbose
             )
 
             if len(X) == 0 or len(y) == 0:
@@ -359,7 +363,6 @@ class ModelTrainer:
                     min_lr=0.00001,
                     verbose=1
                 ),
-                TensorBoard(log_dir=log_dir),
                 ModelCheckpoint(
                     filepath=os.path.join(config.MODEL_DIR, f"lstm_best_{symbol}_{timeframe}.h5"),
                     monitor='val_accuracy',
@@ -489,8 +492,8 @@ class ModelTrainer:
             return {'model': None, 'metrics': {}, 'feature_importance': None}
 
     def train_xgboost_classifier(self, symbol: str, timeframe: str = '5m',
-                                use_advanced_features: bool = True,
-                                verbose: bool = True) -> Dict[str, Any]:
+                                 use_advanced_features: bool = True,
+                                 verbose: bool = True) -> Dict[str, Any]:
         """
         Обучение XGBoost классификатора
         """
@@ -527,7 +530,7 @@ class ModelTrainer:
             expanded_feature_names = []
             for i in range(X.shape[1]):  # Для каждого временного шага
                 for feature_name in feature_names:
-                    expanded_feature_names.append(f"{feature_name}_t-{X.shape[1]-i-1}")
+                    expanded_feature_names.append(f"{feature_name}_t-{X.shape[1] - i - 1}")
 
             print(f"   📐 Размерность X_2d: {X_2d.shape}")
             print(f"   🔤 Количество фичей в 2D: {len(expanded_feature_names)}")
@@ -550,6 +553,12 @@ class ModelTrainer:
                 X_val, fit=False, scaler=scaler, verbose=verbose
             )
 
+            # ВАЖНОЕ ИСПРАВЛЕНИЕ: Сохраняем информацию о фичах в скейлере
+            if hasattr(scaler, 'feature_names_in_'):
+                scaler.feature_names_in_ = expanded_feature_names
+            elif hasattr(scaler, 'feature_names'):
+                scaler.feature_names = expanded_feature_names
+
             # Создание и обучение XGBoost модели
             print(f"\n🌲 Создание XGBoost модели...")
             print(f"   n_estimators: {config.model.XGB_N_ESTIMATORS}")
@@ -571,7 +580,9 @@ class ModelTrainer:
                 n_jobs=-1,
                 verbosity=0,
                 enable_categorical=False,
-                tree_method='hist'  # Более быстрый метод
+                tree_method='hist',
+                eval_metric=['merror', 'mlogloss'],
+                early_stopping_rounds=config.model.XGB_EARLY_STOPPING_ROUNDS
             )
 
             # Обучение с early stopping
@@ -583,9 +594,7 @@ class ModelTrainer:
             model.fit(
                 X_train_norm, y_train,
                 eval_set=eval_set,
-                eval_metric=eval_metric,
-                early_stopping_rounds=config.model.XGB_EARLY_STOPPING_ROUNDS,
-                verbose=10  # Выводим прогресс каждые 10 итераций
+                verbose=10
             )
 
             # Оценка модели
@@ -603,8 +612,8 @@ class ModelTrainer:
 
             # Classification report
             class_report = classification_report(y_val_original, y_pred_original,
-                                                target_names=['DOWN', 'HOLD', 'UP'],
-                                                output_dict=True)
+                                                 target_names=['DOWN', 'HOLD', 'UP'],
+                                                 output_dict=True)
 
             # Feature importance
             feature_importance_dict = {}
@@ -634,17 +643,22 @@ class ModelTrainer:
                 'classification_report': class_report,
                 'training_samples': len(X_train),
                 'validation_samples': len(X_val),
-                'best_iteration': int(model.best_iteration) if hasattr(model, 'best_iteration') else config.model.XGB_N_ESTIMATORS,
+                'best_iteration': int(model.best_iteration) if hasattr(model,
+                                                                       'best_iteration') else config.model.XGB_N_ESTIMATORS,
                 'feature_count': X_train_norm.shape[1],
                 'training_period': {
                     'start': state_manager.get_training_dates()[0].isoformat(),
                     'end': state_manager.get_training_dates()[1].isoformat()
                 },
                 'eval_results': {
-                    'train_merror': model.evals_result()['validation_0']['merror'][-1] if hasattr(model, 'evals_result') else 0,
-                    'train_mlogloss': model.evals_result()['validation_0']['mlogloss'][-1] if hasattr(model, 'evals_result') else 0,
-                    'val_merror': model.evals_result()['validation_1']['merror'][-1] if hasattr(model, 'evals_result') else 0,
-                    'val_mlogloss': model.evals_result()['validation_1']['mlogloss'][-1] if hasattr(model, 'evals_result') else 0
+                    'train_merror': model.evals_result()['validation_0']['merror'][-1] if hasattr(model,
+                                                                                                  'evals_result') else 0,
+                    'train_mlogloss': model.evals_result()['validation_0']['mlogloss'][-1] if hasattr(model,
+                                                                                                      'evals_result') else 0,
+                    'val_merror': model.evals_result()['validation_1']['merror'][-1] if hasattr(model,
+                                                                                                'evals_result') else 0,
+                    'val_mlogloss': model.evals_result()['validation_1']['mlogloss'][-1] if hasattr(model,
+                                                                                                    'evals_result') else 0
                 }
             }
 
@@ -673,17 +687,39 @@ class ModelTrainer:
                 for i, (feature, importance) in enumerate(top_features, 1):
                     print(f"   {i:2d}. {feature:<30} {importance:.4f}")
 
-            # Сохраняем скейлер и информацию о фичах в атрибуте модели
+            # ВАЖНОЕ ИСПРАВЛЕНИЕ: Сохраняем ПРАВИЛЬНЫЕ фичи в атрибутах модели
             model.scaler = scaler
-            model.feature_names = expanded_feature_names
-            model.base_feature_names = feature_names
+            model.feature_names = expanded_feature_names  # КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: используем расширенные фичи (1500), а не базовые
+            model.expanded_feature_names = expanded_feature_names  # Расширенные фичи (1500)
+            model.base_feature_names = feature_names  # Базовые фичи (25) - для обратной совместимости
+            model._features = expanded_feature_names  # Для обратной совместимости - используем расширенные
+
+            # ДОБАВЛЯЕМ КРИТИЧЕСКУЮ ИНФОРМАЦИЮ:
+            model._lookback_window = config.model.LOOKBACK_WINDOW
+            model._base_features_count = len(feature_names)
+            model._expanded_features_count = len(expanded_feature_names)
+            model._model_type = 'xgb_class'  # Явно указываем тип модели
+
+            print(f"\n💾 ИНФОРМАЦИЯ О ФИЧАХ ДЛЯ ПРЕДСКАЗАНИЯ:")
+            print(f"   Базовые фичи: {len(feature_names)}")
+            print(f"   Расширенные фичи (2D): {len(expanded_feature_names)}")
+            print(f"   Lookback window: {config.model.LOOKBACK_WINDOW}")
+            print(f"   Формула: {len(feature_names)} × {config.model.LOOKBACK_WINDOW} = {len(expanded_feature_names)}")
+            print(f"   📋 Первые 10 расширенных фичей: {expanded_feature_names[:10]}")
+
+            # Проверяем, что formula работает
+            expected_expanded = len(feature_names) * config.model.LOOKBACK_WINDOW
+            if expected_expanded != len(expanded_feature_names):
+                print(f"  ⚠️  ВНИМАНИЕ: Формула не совпадает!")
+                print(f"     Ожидалось: {expected_expanded}, получилось: {len(expanded_feature_names)}")
 
             return {
                 'model': model,
                 'metrics': metrics,
                 'feature_importance': feature_importance_dict,
-                'feature_names': expanded_feature_names,
+                'feature_names': expanded_feature_names,  # Теперь возвращаем расширенные фичи
                 'base_feature_names': feature_names,
+                'expanded_feature_names': expanded_feature_names,
                 'scaler': scaler
             }
 
@@ -811,8 +847,35 @@ class ModelTrainer:
             if feature_importance:
                 metrics['feature_importance'] = feature_importance
 
+            # ВАЖНОЕ ИСПРАВЛЕНИЕ: Сохраняем правильные фичи в метриках
+            # Для XGBoost сохраняем расширенные фичи
+            if 'xgb' in model_type:
+                if hasattr(model, 'expanded_feature_names'):
+                    metrics['feature_names'] = model.expanded_feature_names
+                    metrics['base_feature_names'] = model.base_feature_names if hasattr(model,
+                                                                                        'base_feature_names') else []
+                    if verbose:
+                        print(f"  💾 Для XGBoost сохранены расширенные фичи: {len(model.expanded_feature_names)} фичей")
+                        print(
+                            f"  💾 Базовые фичи: {len(model.base_feature_names) if hasattr(model, 'base_feature_names') else 0} фичей")
+                elif hasattr(model, 'feature_names'):
+                    # Проверяем, расширенные ли это фичи
+                    if len(model.feature_names) > 100:  # Много фичей = расширенные
+                        metrics['feature_names'] = model.feature_names
+                        metrics['base_feature_names'] = model.base_feature_names if hasattr(model,
+                                                                                            'base_feature_names') else []
+                    else:
+                        # Базовые фичи - сохраняем как есть
+                        metrics['feature_names'] = model.feature_names
+                        if verbose:
+                            print(f"  ⚠️  Для XGBoost сохранены базовые фичи: {len(model.feature_names)} фичей")
+            else:
+                # Для LSTM сохраняем базовые фичи
+                if hasattr(model, 'feature_names'):
+                    metrics['feature_names'] = model.feature_names
+
             # Сохранение в базу данных
-            self.db.save_model_info(
+            success = self.db.save_model_info(
                 model_id=model_id,
                 symbol=symbol,
                 timeframe=state_manager.get_selected_timeframe(),
@@ -824,16 +887,28 @@ class ModelTrainer:
                 verbose=verbose
             )
 
-            if verbose:
-                print(f"✅ Модель {model_id} сохранена успешно")
-                print(f"   Файл модели: {model_path}")
-                print(f"   Файл скейлера: {scaler_path}")
-                print(f"   Метрики: accuracy={metrics.get('accuracy', metrics.get('val_accuracy', 0)):.4f}")
-
-            return True
+            if success:
+                if verbose:
+                    print(f"✅ Модель {model_id} сохранена успешно")
+                    print(f"   Файл модели: {model_path}")
+                    print(f"   Файл скейлера: {scaler_path}")
+                    print(f"   Метрики: accuracy={metrics.get('accuracy', metrics.get('val_accuracy', 0)):.4f}")
+                    if 'feature_names' in metrics:
+                        print(f"   Сохранено фичей: {len(metrics['feature_names'])}")
+                        if 'xgb' in model_type and len(metrics['feature_names']) > 100:
+                            print(
+                                f"   ⚠️  ВНИМАНИЕ: XGBoost модель сохранила {len(metrics['feature_names'])} расширенных фичей")
+                            print(f"   ⚠️  При предсказании нужно использовать эти же фичи!")
+                return True
+            else:
+                if verbose:
+                    print(f"❌ Ошибка сохранения информации о модели в базу")
+                return False
 
         except Exception as e:
             print(f"❌ Ошибка сохранения модели: {e}")
+            import traceback
+            traceback.print_exc()
             return False
 
     def load_model(self, model_id: str, verbose: bool = True) -> Tuple[Any, Any]:
@@ -891,14 +966,103 @@ class ModelTrainer:
                 self.log(f"Failed to load model from {model_path}", 'error')
                 return None, None
 
-            # Восстанавливаем дополнительные атрибуты из метаданных
+            # ВАЖНОЕ ИСПРАВЛЕНИЕ: Восстанавливаем фичи из метаданных
             if 'metrics' in model_info and model_info['metrics']:
                 try:
                     metrics = json.loads(model_info['metrics'])
+
+                    # Для всех моделей
                     if 'feature_names' in metrics:
                         model.feature_names = metrics['feature_names']
-                except:
-                    pass
+                        if verbose:
+                            print(f"  💾 Загружены фичи из метаданных: {len(model.feature_names)} фичей")
+
+                    # Для XGBoost дополнительная информация
+                    if 'xgb' in model_type:
+                        if 'base_feature_names' in metrics:
+                            model.base_feature_names = metrics['base_feature_names']
+                            if verbose:
+                                print(f"  💾 Базовые фичи: {len(model.base_feature_names)} фичей")
+
+                        # КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: Проверяем и исправляем фичи для XGBoost
+                        if hasattr(model, 'feature_names'):
+                            current_feature_count = len(model.feature_names)
+
+                            # Определяем ожидаемое количество фичей
+                            lookback_window = config.model.LOOKBACK_WINDOW
+                            if hasattr(model, 'base_feature_names'):
+                                base_count = len(model.base_feature_names)
+                                expected_expanded = base_count * lookback_window
+                            else:
+                                # Пытаемся вычислить
+                                base_count = len([f for f in model.feature_names if '_t-' not in str(f)])
+                                expected_expanded = base_count * lookback_window
+
+                            if verbose:
+                                print(f"  🔍 Диагностика фичей XGBoost:")
+                                print(f"     Текущие фичи: {current_feature_count}")
+                                print(f"     Ожидается расширенных: {expected_expanded}")
+                                print(f"     Lookback window: {lookback_window}")
+
+                            # Если фичей мало (базовые), создаем расширенные
+                            if current_feature_count < 100 and current_feature_count * lookback_window == expected_expanded:
+                                if verbose:
+                                    print(f"  🔧 Обнаружены базовые фичи, создаем расширенные...")
+
+                                # Получаем базовые фичи
+                                base_features = []
+                                if hasattr(model, 'base_feature_names'):
+                                    base_features = model.base_feature_names
+                                elif hasattr(model, 'feature_names'):
+                                    base_features = model.feature_names
+
+                                if base_features:
+                                    # Создаем расширенные фичи
+                                    expanded_features = []
+                                    for i in range(lookback_window):
+                                        for feature in base_features:
+                                            expanded_features.append(f"{feature}_t-{lookback_window - i - 1}")
+
+                                    # Сохраняем оба набора
+                                    model.expanded_feature_names = expanded_features
+                                    model.feature_names = expanded_features  # Основные фичи = расширенные
+                                    model._features = base_features  # Для обратной совместимости
+
+                                    if verbose:
+                                        print(f"  ✅ Создано {len(expanded_features)} расширенных фичей")
+                                        print(
+                                            f"  📋 Формула: {len(base_features)} × {lookback_window} = {len(expanded_features)}")
+                            else:
+                                # Проверяем, расширенные ли это уже фичи
+                                if current_feature_count > 100:
+                                    if verbose:
+                                        print(f"  ✅ Похоже на расширенные фичи ({current_feature_count} фичей)")
+                                    model.expanded_feature_names = model.feature_names
+                                else:
+                                    if verbose:
+                                        print(f"  ⚠️  Непонятный формат фичей: {current_feature_count} фичей")
+                except Exception as e:
+                    if verbose:
+                        print(f"  ⚠️  Ошибка загрузки метаданных фичей: {e}")
+
+            # Дополнительная диагностика для XGBoost
+            if 'xgb' in model_type and verbose:
+                print(f"  🔧 Финальная проверка XGBoost модели:")
+                if hasattr(model, 'feature_names'):
+                    print(f"     feature_names: {len(model.feature_names)} фичей")
+                if hasattr(model, 'expanded_feature_names'):
+                    print(f"     expanded_feature_names: {len(model.expanded_feature_names)} фичей")
+                if hasattr(model, 'base_feature_names'):
+                    print(f"     base_feature_names: {len(model.base_feature_names)} фичей")
+
+                # Проверяем, соответствует ли количество фичей ожиданиям модели
+                if hasattr(model, 'feature_names') and hasattr(scaler, 'n_features_in_'):
+                    model_features = len(model.feature_names)
+                    scaler_features = scaler.n_features_in_
+                    if model_features != scaler_features:
+                        print(f"  ⚠️  ВНИМАНИЕ: Модель и скейлер имеют разное количество фичей!")
+                        print(f"     Модель: {model_features} фичей")
+                        print(f"     Скейлер: {scaler_features} фичей")
 
             # Кеширование
             self.model_cache[model_id] = (model, scaler)
@@ -907,11 +1071,19 @@ class ModelTrainer:
                 print(f"✅ Модель {model_id} загружена успешно")
                 print(f"   Тип: {model_type}")
                 print(f"   Путь: {model_path}")
+                if hasattr(model, 'feature_names'):
+                    print(f"   Фичей в модели: {len(model.feature_names)}")
+                    if 'xgb' in model_type and len(model.feature_names) < 100:
+                        print(f"   ⚠️  ВНИМАНИЕ: XGBoost модель имеет только {len(model.feature_names)} фичей")
+                        print(
+                            f"   ⚠️  Модель ожидает {len(model.feature_names) * config.model.LOOKBACK_WINDOW} фичей при предсказании!")
 
             return model, scaler
 
         except Exception as e:
             self.log(f"Error loading model: {e}", 'error')
+            import traceback
+            traceback.print_exc()
             return None, None
 
     def prepare_sequences_with_features(self, df: pd.DataFrame, target_column: str,
@@ -943,6 +1115,14 @@ class ModelTrainer:
 
             # Оставляем только существующие колонки
             feature_columns = [col for col in feature_columns if col in df.columns]
+
+            # ИСКЛЮЧАЕМ ВРЕМЕННЫЕ ФИЧИ ДЛЯ СОВМЕСТИМОСТИ
+            temporal_features = ['HOUR', 'DAY_OF_WEEK', 'MONTH', 'HOUR_OF_DAY', 'DAY', 'WEEK']
+            feature_columns = [col for col in feature_columns
+                               if not any(temp in col for temp in temporal_features)]
+
+            # Сохраняем список фичей для последующего использования
+            self.last_feature_columns = feature_columns.copy()
 
             # Убираем NaN из фичей
             df_features = df[feature_columns].copy()

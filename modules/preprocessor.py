@@ -336,6 +336,13 @@ class DataPreprocessor:
                             signal = {1: 'LONG', 0: 'HOLD', -1: 'SHORT'}.get(cls, 'UNKNOWN')
                             self.log(f"    {signal}: {counts[cls]} ({percentage:.1f}%)", 'info')
 
+            temporal_features = ['HOUR', 'DAY_OF_WEEK', 'MONTH']
+            for temp_feature in temporal_features:
+                if temp_feature in data.columns:
+                    data = data.drop(columns=[temp_feature])
+                    if verbose:
+                        self.log(f"Removed temporal feature: {temp_feature}", 'debug')
+
             # Кешируем результат
             cache_key = f"{len(df)}_{df.index[-1]}"
             self.indicators_cache[cache_key] = data.copy()
@@ -686,3 +693,154 @@ class DataPreprocessor:
         except Exception as e:
             self.log(f"Error balancing classes: {e}", 'error')
             return X, y
+
+    def add_advanced_features(self, df: pd.DataFrame, verbose: bool = True) -> pd.DataFrame:
+        """
+        Добавление расширенных фичей к данным
+
+        Args:
+            df: DataFrame с базовыми индикаторами
+            verbose: Флаг логирования
+
+        Returns:
+            DataFrame с расширенными фичами
+        """
+        try:
+            if df.empty:
+                return df
+
+            data = df.copy()
+
+            if verbose:
+                self.log("Adding advanced features...", 'info')
+
+            # Создаем копию для безопасных операций
+            result = data.copy()
+
+            # 1. Взаимодействия между основными индикаторами
+            try:
+                if 'RSI_14' in result.columns and 'MACD' in result.columns:
+                    result['RSI_MACD_INTERACTION'] = result['RSI_14'] * result['MACD']
+            except:
+                pass
+
+            try:
+                if 'BB_WIDTH' in result.columns and 'ATR_14' in result.columns:
+                    # Избегаем деления на ноль
+                    result['BB_ATR_RATIO'] = result['BB_WIDTH'] / (result['ATR_14'].replace(0, np.nan) + 1e-6)
+            except:
+                pass
+
+            try:
+                if 'VOLUME_MA_20' in result.columns and 'volume' in result.columns:
+                    result['VOLUME_RATIO'] = result['volume'] / (result['VOLUME_MA_20'].replace(0, np.nan) + 1e-6)
+            except:
+                pass
+
+            # 2. Скользящие статистики для ключевых индикаторов
+            key_indicators = ['RSI_14', 'MACD', 'ATR_14', 'OBV']
+            for indicator in key_indicators:
+                if indicator in result.columns:
+                    try:
+                        # Скользящее среднее
+                        result[f'{indicator}_MA_10'] = result[indicator].rolling(window=10, min_periods=3).mean()
+                        result[f'{indicator}_MA_20'] = result[indicator].rolling(window=20, min_periods=5).mean()
+
+                        # Скользящее стандартное отклонение
+                        result[f'{indicator}_STD_10'] = result[indicator].rolling(window=10, min_periods=3).std()
+
+                        # Z-score (нормализованное отклонение)
+                        rolling_mean = result[indicator].rolling(window=20, min_periods=5).mean()
+                        rolling_std = result[indicator].rolling(window=20, min_periods=5).std()
+                        result[f'{indicator}_ZSCORE_20'] = (result[indicator] - rolling_mean) / (
+                                    rolling_std.replace(0, np.nan) + 1e-6)
+                    except:
+                        continue
+
+            # 3. Моменты распределения для доходностей
+            if 'close' in result.columns:
+                try:
+                    returns = result['close'].pct_change()
+                    for window in [10, 20]:
+                        # Используем kurt() вместо kurtosis()
+                        result[f'RETURNS_SKEW_{window}'] = returns.rolling(window=window, min_periods=5).skew()
+                        result[f'RETURNS_KURTOSIS_{window}'] = returns.rolling(window=window,
+                                                                               min_periods=5).kurt()  # Изменено с kurtosis()
+                except Exception as e:
+                    if verbose:
+                        self.log(f"Ошибка при расчете моментов распределения: {e}", 'warning')
+
+            # 4. Ценовые паттерны (упрощенные)
+            if all(col in result.columns for col in ['high', 'low', 'close', 'open']):
+                try:
+                    # Волатильность внутри свечи
+                    result['CANDLE_BODY'] = abs(result['close'] - result['open'])
+                    result['CANDLE_RANGE'] = result['high'] - result['low']
+                    result['BODY_TO_RANGE_RATIO'] = result['CANDLE_BODY'] / (
+                                result['CANDLE_RANGE'].replace(0, np.nan) + 1e-6)
+                except:
+                    pass
+
+            # 5. Volume profile features (безопасная версия)
+            if 'volume' in result.columns and 'close' in result.columns:
+                try:
+                    # Накопление/распределение (Accumulation/Distribution Line)
+                    clv = ((result['close'] - result['low']) - (result['high'] - result['close'])) / (
+                                result['high'] - result['low'])
+                    clv = clv.replace([np.inf, -np.inf], np.nan).fillna(0)
+                    result['ADL'] = (clv * result['volume']).cumsum()
+                except:
+                    pass
+
+            # 6. Разности и производные
+            for window in [1, 2, 3, 5]:
+                for indicator in ['RSI_14', 'MACD', 'ATR_14', 'close']:
+                    if indicator in result.columns:
+                        try:
+                            result[f'{indicator}_DIFF_{window}'] = result[indicator].diff(window)
+                        except:
+                            pass
+
+            # 7. Временные фичи (если индекс - datetime)
+            try:
+                if hasattr(result.index, 'hour'):
+                    result['HOUR_OF_DAY'] = result.index.hour
+                    result['DAY_OF_WEEK'] = result.index.dayofweek
+                    result['DAY_OF_MONTH'] = result.index.day
+
+                    # Циклическое кодирование времени
+                    result['HOUR_SIN'] = np.sin(2 * np.pi * result['HOUR_OF_DAY'] / 24)
+                    result['HOUR_COS'] = np.cos(2 * np.pi * result['HOUR_OF_DAY'] / 24)
+                    result['DAY_SIN'] = np.sin(2 * np.pi * result['DAY_OF_WEEK'] / 7)
+                    result['DAY_COS'] = np.cos(2 * np.pi * result['DAY_OF_WEEK'] / 7)
+            except:
+                pass
+
+            # Удаляем временные колонки если они создавались
+            temp_cols = ['CANDLE_BODY', 'CANDLE_RANGE']
+            for col in temp_cols:
+                if col in result.columns:
+                    result = result.drop(columns=[col])
+
+            # Удаляем строки с NaN значениями, которые появились из-за скользящих окон
+            initial_len = len(result)
+            result = result.dropna()
+            removed_count = initial_len - len(result)
+
+            if verbose:
+                self.log(f"Added {len(result.columns) - len(df.columns)} advanced features", 'info')
+                self.log(f"Removed {removed_count} rows with NaN values from advanced features", 'info')
+                self.log(f"Total features now: {len(result.columns)}", 'info')
+
+                # Показать несколько новых фичей
+                new_features = [col for col in result.columns if col not in df.columns]
+                if new_features:
+                    self.log(f"New features (first 10): {new_features[:10]}", 'debug')
+
+            return result
+
+        except Exception as e:
+            self.log(f"Error adding advanced features: {e}", 'error')
+            import traceback
+            self.log(f"Traceback: {traceback.format_exc()}", 'error')
+            return df
