@@ -10,29 +10,32 @@ import os
 import pickle
 import hashlib
 from datetime import datetime
-from typing import Dict, List, Tuple, Optional, Any
+from typing import Dict, Tuple, Optional, Any, List
 from config import config
+from modules.database import Database
+from modules.preprocessor import DataPreprocessor
+from modules.state_manager import state_manager
+
 
 # Импорты для машинного обучения
 try:
     import tensorflow as tf
-    from tensorflow.keras.models import Sequential, Model, load_model
-    from tensorflow.keras.layers import LSTM, Dense, Dropout, Input, Bidirectional
-    from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint, ReduceLROnPlateau
+    from tensorflow.keras.models import Sequential, load_model
+    from tensorflow.keras.layers import LSTM, Dense, Dropout, Input, BatchNormalization
+    from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint, ReduceLROnPlateau, TensorBoard
     from tensorflow.keras.optimizers import Adam
     from tensorflow.keras.utils import to_categorical
 except ImportError:
-    print("Tensorflow/Keras not installed. Some features will be unavailable.")
+    print("Tensorflow/Keras not installed. LSTM features will be unavailable.")
 
 try:
     import xgboost as xgb
-    from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix
-    from sklearn.model_selection import train_test_split
+    from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix, classification_report
+    from sklearn.model_selection import train_test_split, cross_val_score, StratifiedKFold
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.feature_selection import SelectKBest, f_classif, RFE
 except ImportError:
-    print("XGBoost/scikit-learn not installed. Some features will be unavailable.")
-
-from modules.database import Database
-from modules.preprocessor import DataPreprocessor
+    print("XGBoost/scikit-learn not installed. XGBoost features will be unavailable.")
 
 
 class ModelTrainer:
@@ -61,90 +64,218 @@ class ModelTrainer:
                 self.logger.error(message)
             elif level == 'warning':
                 self.logger.warning(message)
-            elif level == 'debug':
-                self.logger.debug(message)
 
     def generate_model_id(self, symbol: str, model_type: str) -> str:
         """
         Генерация уникального ID для модели
-
-        Args:
-            symbol: Торговая пара
-            model_type: Тип модели
-
-        Returns:
-            Уникальный ID модели
         """
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         random_hash = hashlib.md5(f"{symbol}_{model_type}_{timestamp}".encode()).hexdigest()[:8]
         return f"{symbol}_{model_type}_{timestamp}_{random_hash}"
 
-    def train_lstm_classifier(self, symbol: str, timeframe: str = '5m',
-                              target_column: str = 'TARGET_CLASS_5',
-                              verbose: bool = True) -> Tuple[Any, Dict]:
+    def ensure_training_data(self, symbol: str, timeframe: str, training_days: int) -> bool:
         """
-        Обучение LSTM классификатора
-
-        Args:
-            symbol: Торговая пара
-            timeframe: Таймфрейм
-            target_column: Целевая колонка
-            verbose: Флаг логирования
-
-        Returns:
-            Обученная модель и метрики
+        Гарантирует наличие данных для обучения
+        Возвращает True если данные доступны или успешно загружены
         """
         try:
-            self.log(f"Training LSTM classifier for {symbol} {timeframe}...")
+            from modules.data_fetcher import DataFetcher
+
+            print(f"   🔍 Проверка данных для обучения {symbol} ({timeframe})...")
+
+            # Получаем даты для обучения
+            end_date = datetime.now()
+            start_date = end_date - pd.Timedelta(days=training_days)
+
+            # Проверяем наличие данных в базе
+            existing_data = self.db.get_historical_data(
+                symbol=symbol,
+                timeframe=timeframe,
+                start_date=start_date,
+                end_date=end_date,
+                verbose=False
+            )
+
+            min_samples_needed = config.model.LOOKBACK_WINDOW * 5  # Минимум 5 последовательностей
+            if len(existing_data) >= min_samples_needed:
+                print(f"   ✅ Данные уже есть: {len(existing_data)} свечей")
+                return True
+
+            print(f"   ⚠️  Недостаточно данных: {len(existing_data)} из {min_samples_needed} нужных")
+            print(f"   📥 Загрузка данных с {start_date.date()} по {end_date.date()}...")
+
+            # Загружаем данные
+            data_fetcher = DataFetcher()
+            data = data_fetcher.fetch_historical_data(
+                symbol=symbol,
+                timeframe=timeframe,
+                days_back=training_days
+            )
+
+            if data.empty:
+                print(f"   ❌ Не удалось загрузить данные для {symbol}")
+                return False
+
+            # Сохраняем в базу
+            success = self.db.store_historical_data(
+                symbol=symbol,
+                timeframe=timeframe,
+                data=data,
+                verbose=False
+            )
+
+            if success:
+                print(f"   ✅ Данные загружены и сохранены: {len(data)} свечей")
+                return True
+            else:
+                print(f"   ❌ Ошибка сохранения данных")
+                return False
+
+        except Exception as e:
+            print(f"   ❌ Ошибка проверки данных: {e}")
+            return False
+
+    def prepare_training_data(self, symbol: str, timeframe: str,
+                            use_advanced_features: bool = True,
+                            verbose: bool = True) -> Tuple[np.ndarray, np.ndarray, List[str]]:
+        """
+        Подготовка данных для обучения
+        Возвращает X, y и список фичей
+        """
+        try:
+            # Получаем даты для обучения из state_manager
+            train_start, train_end = state_manager.get_training_dates()
+
+            print(f"   📅 Получение данных с {train_start.date()} по {train_end.date()}...")
 
             # Получение данных
             data = self.db.get_historical_data(
                 symbol=symbol,
                 timeframe=timeframe,
-                start_date=config.TRAIN_START_DATE,
-                end_date=config.TRAIN_END_DATE,
+                start_date=train_start,
+                end_date=train_end,
                 verbose=verbose
             )
 
             if data.empty:
-                self.log(f"No data for {symbol} {timeframe}", 'error')
-                return None, {}
+                print("❌ Нет данных для указанного периода")
+                return np.array([]), np.array([]), []
+
+            print(f"   ✅ Получено {len(data)} свечей")
 
             # Расчет индикаторов
+            print(f"   📊 Расчет индикаторов...")
             data_with_indicators = self.preprocessor.calculate_all_indicators(
                 data, verbose=verbose
             )
 
             if data_with_indicators.empty:
-                self.log("Failed to calculate indicators", 'error')
-                return None, {}
+                print("❌ Не удалось рассчитать индикаторы")
+                return np.array([]), np.array([]), []
+
+            # Добавляем расширенные фичи если нужно
+            if use_advanced_features:
+                print(f"   🔧 Добавление расширенных фич...")
+                data_with_indicators = self.preprocessor.add_advanced_features(
+                    data_with_indicators, verbose=verbose
+                )
+
+            print(f"   ✅ Всего фичей: {len(data_with_indicators.columns)}")
+
+            # Проверяем какие целевые переменные есть
+            target_columns = [col for col in data_with_indicators.columns if col.startswith('TARGET_')]
+
+            if not target_columns:
+                print("❌ Не найдены целевые переменные")
+                return np.array([]), np.array([]), []
+
+            # Используем TARGET_CLASS_5 по умолчанию
+            target_column = 'TARGET_CLASS_5'
+            if target_column not in data_with_indicators.columns:
+                target_column = target_columns[0]  # Используем первую доступную
+
+            print(f"   🎯 Используется целевая переменная: {target_column}")
+
+            # Проверяем распределение классов
+            if target_column in data_with_indicators.columns:
+                class_dist = data_with_indicators[target_column].value_counts()
+                print(f"   📈 Распределение классов:")
+                for cls, count in class_dist.items():
+                    percentage = (count / len(data_with_indicators)) * 100
+                    print(f"      Класс {cls}: {count} ({percentage:.1f}%)")
+
+                # Проверяем баланс классов
+                min_class = class_dist.min()
+                max_class = class_dist.max()
+                if min_class > 0:
+                    imbalance_ratio = max_class / min_class
+                    if imbalance_ratio > 3:
+                        print(f"   ⚠️  Сильный дисбаланс классов: соотношение {imbalance_ratio:.1f}:1")
+
+            # Удаляем строки с NaN в целевой переменной
+            initial_len = len(data_with_indicators)
+            data_with_indicators = data_with_indicators.dropna(subset=[target_column])
+            if len(data_with_indicators) < initial_len:
+                print(f"   🧹 Удалено {initial_len - len(data_with_indicators)} строк с NaN в целевой переменной")
 
             # Подготовка данных для обучения
-            X, y = self.preprocessor.prepare_features_for_training(
+            print(f"   🔄 Подготовка последовательностей...")
+            X, y, feature_names = self.prepare_sequences_with_features(
                 df=data_with_indicators,
                 target_column=target_column,
                 lookback_window=config.model.LOOKBACK_WINDOW,
-                verbose=verbose
+                use_advanced_features=use_advanced_features,
+                verbose=verbose  # Добавляем этот параметр
             )
 
             if len(X) == 0 or len(y) == 0:
-                self.log("No data for training after preprocessing", 'error')
-                return None, {}
+                print("❌ Не удалось создать последовательности для обучения")
+                return np.array([]), np.array([]), []
 
-            # ДИАГНОСТИКА: логируем распределение классов
-            unique, counts = np.unique(y, return_counts=True)
-            self.log(f"Original class distribution:", 'info')
-            total = len(y)
-            for cls, cnt in zip(unique, counts):
-                percentage = (cnt / total) * 100
-                self.log(f"  Class {cls}: {cnt} samples ({percentage:.1f}%)", 'info')
+            print(f"   ✅ Создано {len(X)} последовательностей")
+            print(f"   📐 Размерность X: {X.shape}")
+            print(f"   📐 Размерность y: {y.shape}")
+            print(f"   🔤 Количество фичей: {len(feature_names)}")
 
-            # ПРОВЕРКА: если слишком много HOLD (класс 0), предлагаем решение
-            hold_percentage = (counts[unique == 0][0] / total * 100) if 0 in unique else 0
-            if hold_percentage > 80:
-                self.log(f"WARNING: Too many HOLD samples ({hold_percentage:.1f}%)! Consider adjusting thresholds.", 'warning')
+            return X, y, feature_names
 
-            # Преобразование меток для классификации (3 класса: -1, 0, 1 -> 0, 1, 2)
+        except Exception as e:
+            print(f"❌ Ошибка подготовки данных: {e}")
+            import traceback
+            traceback.print_exc()
+            return np.array([]), np.array([]), []
+
+    def train_lstm_classifier(self, symbol: str, timeframe: str = '5m',
+                            use_advanced_features: bool = True,
+                            verbose: bool = True) -> Dict[str, Any]:
+        """
+        Обучение LSTM классификатора
+        """
+        try:
+            print(f"\n🚀 НАЧИНАЕМ ОБУЧЕНИЕ LSTM МОДЕЛИ")
+            print(f"   Криптовалюта: {symbol}")
+            print(f"   Таймфрейм: {timeframe}")
+            print(f"   Расширенные фичи: {'Да' if use_advanced_features else 'Нет'}")
+            print("=" * 70)
+
+            # Гарантируем наличие данных для обучения
+            training_days = state_manager.get_training_period()
+            if not self.ensure_training_data(symbol, timeframe, training_days):
+                print("❌ Не удалось обеспечить данные для обучения LSTM")
+                return {'model': None, 'metrics': {}, 'feature_importance': None}
+
+            # Подготовка данных
+            X, y, feature_names = self.prepare_training_data(
+                symbol, timeframe, use_advanced_features, verbose
+            )
+
+            if len(X) == 0:
+                print("❌ Нет данных для обучения")
+                return {'model': None, 'metrics': {}, 'feature_importance': None}
+
+            print(f"✅ Данные подготовлены: {len(X)} последовательностей")
+
+            # Преобразование меток для классификации
             y_categorical = y + 1  # Преобразуем [-1, 0, 1] -> [0, 1, 2]
             y_categorical = to_categorical(y_categorical, num_classes=3)
 
@@ -153,7 +284,12 @@ class ModelTrainer:
                 X, y_categorical, test_size=0.2, random_state=42, stratify=y_categorical
             )
 
+            print(f"📈 Разделение данных:")
+            print(f"   Обучающая выборка: {len(X_train)} последовательностей")
+            print(f"   Валидационная выборка: {len(X_val)} последовательностей")
+
             # Нормализация
+            print(f"🔢 Нормализация данных...")
             X_train_norm, scaler = self.preprocessor.normalize_features(
                 X_train, fit=True, verbose=verbose
             )
@@ -162,177 +298,251 @@ class ModelTrainer:
             )
 
             # Создание модели LSTM
+            print(f"🏗️  Создание архитектуры LSTM...")
+            input_shape = (X_train_norm.shape[1], X_train_norm.shape[2])
+
             model = Sequential([
-                Input(shape=(X_train_norm.shape[1], X_train_norm.shape[2])),
+                Input(shape=input_shape),
                 LSTM(config.model.LSTM_UNITS[0], return_sequences=True,
-                     dropout=config.model.LSTM_DROPOUT),
+                     dropout=config.model.LSTM_DROPOUT, recurrent_dropout=config.model.LSTM_DROPOUT),
+                BatchNormalization(),
                 LSTM(config.model.LSTM_UNITS[1], return_sequences=True,
-                     dropout=config.model.LSTM_DROPOUT),
+                     dropout=config.model.LSTM_DROPOUT, recurrent_dropout=config.model.LSTM_DROPOUT),
+                BatchNormalization(),
                 LSTM(config.model.LSTM_UNITS[2], dropout=config.model.LSTM_DROPOUT),
+                BatchNormalization(),
+                Dense(128, activation='relu'),
+                Dropout(0.4),
                 Dense(64, activation='relu'),
                 Dropout(0.3),
                 Dense(32, activation='relu'),
                 Dropout(0.2),
-                Dense(3, activation='softmax')  # 3 класса
+                Dense(3, activation='softmax')
             ])
 
             # Компиляция модели
+            print(f"⚙️  Компиляция модели...")
             model.compile(
-                optimizer=Adam(learning_rate=0.001),
+                optimizer=Adam(learning_rate=config.model.LSTM_LEARNING_RATE),
                 loss='categorical_crossentropy',
-                metrics=['accuracy', 'Precision', 'Recall']
+                metrics=['accuracy', tf.keras.metrics.Precision(name='precision'),
+                        tf.keras.metrics.Recall(name='recall'),
+                        tf.keras.metrics.AUC(name='auc')]
             )
 
+            # Показываем архитектуру модели
+            print(f"\n🏛️  Архитектура модели:")
+            model.summary(print_fn=lambda x: print(f"   {x}"))
+
             # Callbacks
+            print(f"\n⏱️  Начинаем обучение...")
+            print(f"   Эпох: {config.model.LSTM_EPOCHS}")
+            print(f"   Размер батча: {config.model.LSTM_BATCH_SIZE}")
+            print(f"   Learning rate: {config.model.LSTM_LEARNING_RATE}")
+            print(f"   Early stopping patience: {config.model.LSTM_PATIENCE}")
+
+            # Создаем каталог для логирования TensorBoard
+            log_dir = os.path.join(config.LOG_DIR, "tensorboard", datetime.now().strftime("%Y%m%d-%H%M%S"))
+            os.makedirs(log_dir, exist_ok=True)
+
             callbacks = [
                 EarlyStopping(
                     monitor='val_loss',
                     patience=config.model.LSTM_PATIENCE,
                     restore_best_weights=True,
-                    verbose=1 if verbose else 0
-                ),
-                ModelCheckpoint(
-                    filepath=os.path.join(config.MODEL_DIR, f'{symbol}_lstm_best.h5'),
-                    monitor='val_loss',
-                    save_best_only=True,
-                    verbose=0
+                    verbose=1
                 ),
                 ReduceLROnPlateau(
                     monitor='val_loss',
                     factor=0.5,
                     patience=5,
                     min_lr=0.00001,
-                    verbose=1 if verbose else 0
+                    verbose=1
+                ),
+                TensorBoard(log_dir=log_dir),
+                ModelCheckpoint(
+                    filepath=os.path.join(config.MODEL_DIR, f"lstm_best_{symbol}_{timeframe}.h5"),
+                    monitor='val_accuracy',
+                    save_best_only=True,
+                    verbose=0
                 )
             ]
 
             # Обучение модели
+            print(f"\n🎓 Обучение началось:")
+            print("=" * 70)
+
             history = model.fit(
                 X_train_norm, y_train,
                 epochs=config.model.LSTM_EPOCHS,
                 batch_size=config.model.LSTM_BATCH_SIZE,
                 validation_data=(X_val_norm, y_val),
                 callbacks=callbacks,
-                verbose=1 if verbose else 0
+                verbose=1
             )
+
+            print("=" * 70)
+            print(f"✅ Обучение завершено!")
+            print(f"   Количество эпох: {len(history.history['loss'])}")
 
             # Оценка модели
-            val_loss, val_accuracy, val_precision, val_recall = model.evaluate(
-                X_val_norm, y_val, verbose=0
-            )
+            print(f"\n📊 Оценка модели на валидационной выборке...")
+            eval_results = model.evaluate(X_val_norm, y_val, verbose=0)
 
-            # Предсказания для дополнительных метрик
+            # Расчет дополнительных метрик
             y_pred_proba = model.predict(X_val_norm, verbose=0)
             y_pred = np.argmax(y_pred_proba, axis=1)
             y_true = np.argmax(y_val, axis=1)
-
-            # Преобразуем обратно: [0, 1, 2] -> [-1, 0, 1]
             y_pred_original = y_pred - 1
             y_true_original = y_true - 1
 
-            # Расчет метрик
+            # Подробные метрики
+            accuracy = accuracy_score(y_true_original, y_pred_original)
+            precision = precision_score(y_true_original, y_pred_original, average='weighted')
+            recall = recall_score(y_true_original, y_pred_original, average='weighted')
             f1 = f1_score(y_true_original, y_pred_original, average='weighted')
             conf_matrix = confusion_matrix(y_true_original, y_pred_original)
 
+            # Classification report
+            class_report = classification_report(y_true_original, y_pred_original,
+                                                target_names=['DOWN', 'HOLD', 'UP'],
+                                                output_dict=True)
+
             # Подготовка метрик
             metrics = {
-                'val_loss': float(val_loss),
-                'val_accuracy': float(val_accuracy),
-                'val_precision': float(val_precision),
-                'val_recall': float(val_recall),
+                'val_loss': float(eval_results[0]),
+                'val_accuracy': float(eval_results[1]),
+                'val_precision': float(eval_results[2]),
+                'val_recall': float(eval_results[3]),
+                'val_auc': float(eval_results[4]),
+                'accuracy': float(accuracy),
+                'precision': float(precision),
+                'recall': float(recall),
                 'f1_score': float(f1),
                 'confusion_matrix': conf_matrix.tolist(),
+                'classification_report': class_report,
                 'training_samples': len(X_train),
                 'validation_samples': len(X_val),
-                'class_distribution_train': {
-                    int(cls-1): int(count) for cls, count in zip(*np.unique(y_train.argmax(axis=1)-1, return_counts=True))
+                'feature_count': X_train_norm.shape[2],
+                'sequence_length': X_train_norm.shape[1],
+                'training_period': {
+                    'start': state_manager.get_training_dates()[0].isoformat(),
+                    'end': state_manager.get_training_dates()[1].isoformat()
                 },
-                'class_distribution_val': {
-                    int(cls-1): int(count) for cls, count in zip(*np.unique(y_true_original, return_counts=True))
+                'training_history': {
+                    'loss': [float(x) for x in history.history.get('loss', [])],
+                    'val_loss': [float(x) for x in history.history.get('val_loss', [])],
+                    'accuracy': [float(x) for x in history.history.get('accuracy', [])],
+                    'val_accuracy': [float(x) for x in history.history.get('val_accuracy', [])]
                 }
             }
 
-            # Логирование результатов
-            if verbose:
-                self.log(f"LSTM training completed:")
-                self.log(f"  Validation Loss: {val_loss:.4f}")
-                self.log(f"  Validation Accuracy: {val_accuracy:.4f}")
-                self.log(f"  Validation Precision: {val_precision:.4f}")
-                self.log(f"  Validation Recall: {val_recall:.4f}")
-                self.log(f"  F1 Score: {f1:.4f}")
-                self.log(f"  Confusion Matrix:\n{conf_matrix}")
+            print(f"\n🎯 РЕЗУЛЬТАТЫ ОБУЧЕНИЯ LSTM:")
+            print(f"   Validation Loss: {metrics['val_loss']:.4f}")
+            print(f"   Validation Accuracy: {metrics['val_accuracy']:.4f}")
+            print(f"   Accuracy: {metrics['accuracy']:.4f}")
+            print(f"   Precision: {metrics['precision']:.4f}")
+            print(f"   Recall: {metrics['recall']:.4f}")
+            print(f"   F1 Score: {metrics['f1_score']:.4f}")
+            print(f"   AUC: {metrics['val_auc']:.4f}")
 
-            return model, metrics
+            # Показываем confusion matrix
+            print(f"\n📊 CONFUSION MATRIX:")
+            print("   DOWN  HOLD  UP")
+            for i, row in enumerate(conf_matrix):
+                class_name = ['DOWN', 'HOLD', 'UP'][i]
+                print(f"   {class_name} {row}")
+
+            # Feature importance для LSTM (средние веса)
+            feature_importance = None
+            try:
+                # Простой способ оценки важности фичей для LSTM
+                layer_weights = []
+                for layer in model.layers:
+                    if isinstance(layer, LSTM):
+                        layer_weights.append(layer.get_weights()[0])  # Веса ячеек
+
+                if layer_weights:
+                    avg_weights = np.mean([np.mean(np.abs(w), axis=1) for w in layer_weights], axis=0)
+                    if len(avg_weights) == len(feature_names):
+                        feature_importance = dict(zip(feature_names, avg_weights.tolist()))
+                        print(f"\n📈 Рассчитана важность фичей для LSTM")
+            except:
+                pass
+
+            # Сохраняем скейлер в атрибуте модели
+            model.scaler = scaler
+            model.feature_names = feature_names
+
+            return {
+                'model': model,
+                'metrics': metrics,
+                'feature_importance': feature_importance,
+                'feature_names': feature_names,
+                'scaler': scaler
+            }
 
         except Exception as e:
-            self.log(f"Error training LSTM classifier: {e}", 'error')
-            return None, {}
+            print(f"\n❌ ОШИБКА ОБУЧЕНИЯ LSTM: {e}")
+            import traceback
+            traceback.print_exc()
+            return {'model': None, 'metrics': {}, 'feature_importance': None}
 
     def train_xgboost_classifier(self, symbol: str, timeframe: str = '5m',
-                                 target_column: str = 'TARGET_CLASS_5',
-                                 verbose: bool = True) -> Tuple[Any, Dict]:
+                                use_advanced_features: bool = True,
+                                verbose: bool = True) -> Dict[str, Any]:
         """
         Обучение XGBoost классификатора
-
-        Args:
-            symbol: Торговая пара
-            timeframe: Таймфрейм
-            target_column: Целевая колонка
-            verbose: Флаг логирования
-
-        Returns:
-            Обученная модель и метрики
         """
         try:
-            self.log(f"Training XGBoost classifier for {symbol} {timeframe}...")
+            print(f"\n🚀 НАЧИНАЕМ ОБУЧЕНИЕ XGBOOST МОДЕЛИ")
+            print(f"   Криптовалюта: {symbol}")
+            print(f"   Таймфрейм: {timeframe}")
+            print(f"   Расширенные фичи: {'Да' if use_advanced_features else 'Нет'}")
+            print("=" * 70)
 
-            # Получение данных
-            data = self.db.get_historical_data(
-                symbol=symbol,
-                timeframe=timeframe,
-                start_date=config.TRAIN_START_DATE,
-                end_date=config.TRAIN_END_DATE,
-                verbose=verbose
+            # Гарантируем наличие данных для обучения
+            training_days = state_manager.get_training_period()
+            if not self.ensure_training_data(symbol, timeframe, training_days):
+                print("❌ Не удалось обеспечить данные для обучения XGBoost")
+                return {'model': None, 'metrics': {}, 'feature_importance': None}
+
+            # Подготовка данных
+            X, y, feature_names = self.prepare_training_data(
+                symbol, timeframe, use_advanced_features, verbose
             )
 
-            if data.empty:
-                self.log(f"No data for {symbol} {timeframe}", 'error')
-                return None, {}
+            if len(X) == 0:
+                print("❌ Нет данных для обучения")
+                return {'model': None, 'metrics': {}, 'feature_importance': None}
 
-            # Расчет индикаторов
-            data_with_indicators = self.preprocessor.calculate_all_indicators(
-                data, verbose=verbose
-            )
+            print(f"✅ Данные подготовлены: {len(X)} последовательностей")
+            print(f"   Преобразование 3D -> 2D для XGBoost...")
 
-            if data_with_indicators.empty:
-                self.log("Failed to calculate indicators", 'error')
-                return None, {}
+            # Преобразование 3D -> 2D для XGBoost
+            X_2d = X.reshape(X.shape[0], -1)
+            y_xgb = y + 1  # Преобразуем [-1, 0, 1] -> [0, 1, 2]
 
-            # Подготовка данных для XGBoost (2D вместо 3D для LSTM)
-            feature_columns = [col for col in data_with_indicators.columns
-                               if not col.startswith('TARGET_')
-                               and col not in ['open', 'high', 'low', 'close', 'volume']]
+            # Проверяем и создаем новые имена фичей для 2D представления
+            expanded_feature_names = []
+            for i in range(X.shape[1]):  # Для каждого временного шага
+                for feature_name in feature_names:
+                    expanded_feature_names.append(f"{feature_name}_t-{X.shape[1]-i-1}")
 
-            X = data_with_indicators[feature_columns].values
-            y = data_with_indicators[target_column].values
-
-            # ДИАГНОСТИКА: логируем распределение классов
-            unique, counts = np.unique(y, return_counts=True)
-            self.log(f"Class distribution for XGBoost:", 'info')
-            total = len(y)
-            for cls, cnt in zip(unique, counts):
-                percentage = (cnt / total) * 100
-                self.log(f"  Class {cls}: {cnt} samples ({percentage:.1f}%)", 'info')
-
-            # Преобразование меток для XGBoost (-1, 0, 1 -> 0, 1, 2)
-            y_xgb = y + 1
+            print(f"   📐 Размерность X_2d: {X_2d.shape}")
+            print(f"   🔤 Количество фичей в 2D: {len(expanded_feature_names)}")
 
             # Разделение на train/validation
             X_train, X_val, y_train, y_val = train_test_split(
-                X, y_xgb, test_size=0.2, random_state=42, stratify=y_xgb
+                X_2d, y_xgb, test_size=0.2, random_state=42, stratify=y_xgb
             )
 
+            print(f"📈 Разделение данных:")
+            print(f"   Обучающая выборка: {len(X_train)} образцов")
+            print(f"   Валидационная выборка: {len(X_val)} образцов")
+
             # Нормализация
+            print(f"🔢 Нормализация данных...")
             X_train_norm, scaler = self.preprocessor.normalize_features(
                 X_train, fit=True, verbose=verbose
             )
@@ -341,39 +551,78 @@ class ModelTrainer:
             )
 
             # Создание и обучение XGBoost модели
+            print(f"\n🌲 Создание XGBoost модели...")
+            print(f"   n_estimators: {config.model.XGB_N_ESTIMATORS}")
+            print(f"   max_depth: {config.model.XGB_MAX_DEPTH}")
+            print(f"   learning_rate: {config.model.XGB_LEARNING_RATE}")
+            print(f"   subsample: {config.model.XGB_SUBSAMPLE}")
+            print(f"   colsample_bytree: {config.model.XGB_COLSAMPLE_BYTREE}")
+            print(f"   early_stopping_rounds: {config.model.XGB_EARLY_STOPPING_ROUNDS}")
+
             model = xgb.XGBClassifier(
                 n_estimators=config.model.XGB_N_ESTIMATORS,
                 max_depth=config.model.XGB_MAX_DEPTH,
                 learning_rate=config.model.XGB_LEARNING_RATE,
+                subsample=config.model.XGB_SUBSAMPLE,
+                colsample_bytree=config.model.XGB_COLSAMPLE_BYTREE,
                 objective='multi:softprob',
                 num_class=3,
                 random_state=42,
                 n_jobs=-1,
-                verbosity=0
+                verbosity=0,
+                enable_categorical=False,
+                tree_method='hist'  # Более быстрый метод
             )
 
             # Обучение с early stopping
+            print(f"\n🎓 Начинаем обучение XGBoost...")
+
+            eval_set = [(X_train_norm, y_train), (X_val_norm, y_val)]
+            eval_metric = ["merror", "mlogloss"]
+
             model.fit(
                 X_train_norm, y_train,
-                eval_set=[(X_val_norm, y_val)],
+                eval_set=eval_set,
+                eval_metric=eval_metric,
                 early_stopping_rounds=config.model.XGB_EARLY_STOPPING_ROUNDS,
-                verbose=False
+                verbose=10  # Выводим прогресс каждые 10 итераций
             )
 
             # Оценка модели
+            print(f"\n📊 Оценка модели...")
             y_pred = model.predict(X_val_norm)
             y_pred_proba = model.predict_proba(X_val_norm)
-
-            # Преобразуем обратно: [0, 1, 2] -> [-1, 0, 1]
             y_pred_original = y_pred - 1
             y_val_original = y_val - 1
 
-            # Расчет метрик
             accuracy = accuracy_score(y_val_original, y_pred_original)
             precision = precision_score(y_val_original, y_pred_original, average='weighted')
             recall = recall_score(y_val_original, y_pred_original, average='weighted')
             f1 = f1_score(y_val_original, y_pred_original, average='weighted')
             conf_matrix = confusion_matrix(y_val_original, y_pred_original)
+
+            # Classification report
+            class_report = classification_report(y_val_original, y_pred_original,
+                                                target_names=['DOWN', 'HOLD', 'UP'],
+                                                output_dict=True)
+
+            # Feature importance
+            feature_importance_dict = {}
+            if hasattr(model, 'feature_importances_'):
+                importance_values = model.feature_importances_
+                if len(importance_values) == len(expanded_feature_names):
+                    for i, feature_name in enumerate(expanded_feature_names):
+                        feature_importance_dict[feature_name] = float(importance_values[i])
+
+                # Группируем по основным фичам (без временных лагов)
+                aggregated_importance = {}
+                for feature_name, importance in feature_importance_dict.items():
+                    base_feature = feature_name.split('_t-')[0]  # Убираем временной лаг
+                    aggregated_importance[base_feature] = aggregated_importance.get(base_feature, 0) + importance
+
+                # Сортируем по важности
+                sorted_features = sorted(aggregated_importance.items(), key=lambda x: x[1], reverse=True)
+                feature_importance_dict = dict(sorted_features[:20])  # Топ-20 фичей
 
             # Подготовка метрик
             metrics = {
@@ -382,122 +631,214 @@ class ModelTrainer:
                 'recall': float(recall),
                 'f1_score': float(f1),
                 'confusion_matrix': conf_matrix.tolist(),
+                'classification_report': class_report,
                 'training_samples': len(X_train),
                 'validation_samples': len(X_val),
-                'best_iteration': model.best_iteration if hasattr(model, 'best_iteration') else config.model.XGB_N_ESTIMATORS,
-                'class_distribution_train': {
-                    int(cls-1): int(count) for cls, count in zip(*np.unique(y_train-1, return_counts=True))
+                'best_iteration': int(model.best_iteration) if hasattr(model, 'best_iteration') else config.model.XGB_N_ESTIMATORS,
+                'feature_count': X_train_norm.shape[1],
+                'training_period': {
+                    'start': state_manager.get_training_dates()[0].isoformat(),
+                    'end': state_manager.get_training_dates()[1].isoformat()
                 },
-                'class_distribution_val': {
-                    int(cls-1): int(count) for cls, count in zip(*np.unique(y_val_original, return_counts=True))
+                'eval_results': {
+                    'train_merror': model.evals_result()['validation_0']['merror'][-1] if hasattr(model, 'evals_result') else 0,
+                    'train_mlogloss': model.evals_result()['validation_0']['mlogloss'][-1] if hasattr(model, 'evals_result') else 0,
+                    'val_merror': model.evals_result()['validation_1']['merror'][-1] if hasattr(model, 'evals_result') else 0,
+                    'val_mlogloss': model.evals_result()['validation_1']['mlogloss'][-1] if hasattr(model, 'evals_result') else 0
                 }
             }
 
-            # Логирование результатов
-            if verbose:
-                self.log(f"XGBoost training completed:")
-                self.log(f"  Accuracy: {accuracy:.4f}")
-                self.log(f"  Precision: {precision:.4f}")
-                self.log(f"  Recall: {recall:.4f}")
-                self.log(f"  F1 Score: {f1:.4f}")
-                self.log(f"  Confusion Matrix:\n{conf_matrix}")
-                self.log(f"  Best iteration: {metrics['best_iteration']}")
+            print(f"\n🎯 РЕЗУЛЬТАТЫ ОБУЧЕНИЯ XGBOOST:")
+            print(f"   Accuracy: {accuracy:.4f}")
+            print(f"   Precision: {precision:.4f}")
+            print(f"   Recall: {recall:.4f}")
+            print(f"   F1 Score: {f1:.4f}")
+            print(f"   Best iteration: {metrics['best_iteration']}")
 
-            return model, metrics
+            if 'eval_results' in metrics:
+                print(f"   Train merror: {metrics['eval_results']['train_merror']:.4f}")
+                print(f"   Validation merror: {metrics['eval_results']['val_merror']:.4f}")
+
+            # Показываем confusion matrix
+            print(f"\n📊 CONFUSION MATRIX:")
+            print("   DOWN  HOLD  UP")
+            for i, row in enumerate(conf_matrix):
+                class_name = ['DOWN', 'HOLD', 'UP'][i]
+                print(f"   {class_name} {row}")
+
+            # Показываем топ фичей по важности
+            if feature_importance_dict:
+                print(f"\n🏆 ТОП-10 ВАЖНЕЙШИХ ФИЧ:")
+                top_features = sorted(feature_importance_dict.items(), key=lambda x: x[1], reverse=True)[:10]
+                for i, (feature, importance) in enumerate(top_features, 1):
+                    print(f"   {i:2d}. {feature:<30} {importance:.4f}")
+
+            # Сохраняем скейлер и информацию о фичах в атрибуте модели
+            model.scaler = scaler
+            model.feature_names = expanded_feature_names
+            model.base_feature_names = feature_names
+
+            return {
+                'model': model,
+                'metrics': metrics,
+                'feature_importance': feature_importance_dict,
+                'feature_names': expanded_feature_names,
+                'base_feature_names': feature_names,
+                'scaler': scaler
+            }
 
         except Exception as e:
-            self.log(f"Error training XGBoost classifier: {e}", 'error')
-            return None, {}
+            print(f"\n❌ ОШИБКА ОБУЧЕНИЯ XGBOOST: {e}")
+            import traceback
+            traceback.print_exc()
+            return {'model': None, 'metrics': {}, 'feature_importance': None}
 
-    def save_model(self, model, scaler, model_id: str, symbol: str,
-                   model_type: str, metrics: Dict, verbose: bool = True) -> bool:
+    def compare_models(self, comparison_results: Dict[str, Dict]):
+        """
+        Сравнение результатов разных моделей
+        """
+        print(f"\n🔬 СРАВНЕНИЕ МОДЕЛЕЙ:")
+        print("=" * 80)
+
+        if not comparison_results:
+            print("   ❌ Нет данных для сравнения")
+            return
+
+        print(f"{'Модель':<15} {'Accuracy':<10} {'F1 Score':<10} {'Precision':<10} {'Recall':<10} {'Samples':<10}")
+        print("-" * 80)
+
+        best_model = None
+        best_score = -1
+
+        for model_name, results in comparison_results.items():
+            metrics = results.get('metrics', {})
+            accuracy = metrics.get('accuracy', metrics.get('val_accuracy', 0))
+            f1 = metrics.get('f1_score', 0)
+            precision = metrics.get('precision', metrics.get('val_precision', 0))
+            recall = metrics.get('recall', metrics.get('val_recall', 0))
+            samples = metrics.get('training_samples', 0) + metrics.get('validation_samples', 0)
+
+            print(f"{model_name:<15} {accuracy:.4f}      {f1:.4f}      {precision:.4f}      {recall:.4f}      {samples:<10}")
+
+            # Определяем лучшую модель по F1 score
+            if f1 > best_score:
+                best_score = f1
+                best_model = model_name
+
+        print("-" * 80)
+        print(f"🏆 ЛУЧШАЯ МОДЕЛЬ: {best_model} (F1 Score: {best_score:.4f})")
+
+        # Дополнительные рекомендации
+        print(f"\n💡 РЕКОМЕНДАЦИИ:")
+        if best_score > 0.6:
+            print(f"   ✅ Отличные результаты! Модель {best_model} показывает высокую точность")
+        elif best_score > 0.5:
+            print(f"   👍 Хорошие результаты, можно использовать {best_model} для торговли")
+        else:
+            print(f"   ⚠️  Результаты ниже среднего, рекомендуется:")
+            print(f"      1. Увеличить период обучения")
+            print(f"      2. Добавить больше индикаторов")
+            print(f"      3. Попробовать другие параметры моделей")
+
+    def save_model(self, model: Any, model_id: str, symbol: str,
+                   model_type: str, metrics: Dict,
+                   feature_importance: Dict = None,
+                   verbose: bool = True) -> bool:
         """
         Сохранение модели и метаданных
-
-        Args:
-            model: Обученная модель
-            scaler: Скейлер для нормализации
-            model_id: ID модели
-            symbol: Торговая пара
-            model_type: Тип модели
-            metrics: Метрики модели
-            verbose: Флаг логирования
-
-        Returns:
-            True если успешно
         """
         try:
-            # Сохранение модели
-            model_path = os.path.join(config.MODEL_DIR, f"{model_id}.h5")
-            scaler_path = os.path.join(config.MODEL_DIR, f"{model_id}_scaler.pkl")
+            # Пути для сохранения
+            model_filename = f"{model_id}.h5" if 'lstm' in model_type else f"{model_id}.pkl"
+            model_path = os.path.join(config.MODEL_DIR, model_filename)
 
+            scaler_filename = f"{model_id}_scaler.pkl"
+            scaler_path = os.path.join(config.MODEL_DIR, scaler_filename)
+
+            # Сохранение модели
             if 'lstm' in model_type:
                 model.save(model_path)
             elif 'xgb' in model_type:
-                with open(model_path.replace('.h5', '.pkl'), 'wb') as f:
+                with open(model_path, 'wb') as f:
                     pickle.dump(model, f)
+            else:
+                self.log(f"Unknown model type: {model_type}", 'error')
+                return False
 
             # Сохранение скейлера
-            with open(scaler_path, 'wb') as f:
-                pickle.dump(scaler, f)
+            if hasattr(model, 'scaler') and model.scaler is not None:
+                with open(scaler_path, 'wb') as f:
+                    pickle.dump(model.scaler, f)
+            else:
+                # Если скейлера нет, создаем пустой файл
+                with open(scaler_path, 'wb') as f:
+                    pickle.dump(None, f)
 
             # Подготовка параметров для сохранения
             parameters = {
                 'lookback_window': config.model.LOOKBACK_WINDOW,
-                'target_column': 'TARGET_CLASS_5',
+                'prediction_horizon': config.model.PREDICTION_HORIZON,
+                'timeframe': state_manager.get_selected_timeframe(),
                 'training_period': {
-                    'start': config.TRAIN_START_DATE.isoformat(),
-                    'end': config.TRAIN_END_DATE.isoformat()
-                }
+                    'days': state_manager.get_training_period(),
+                    'start': state_manager.get_training_dates()[0].isoformat(),
+                    'end': state_manager.get_training_dates()[1].isoformat()
+                },
+                'feature_count': metrics.get('feature_count', 0),
+                'use_advanced_features': True  # По умолчанию включено
             }
 
             if 'lstm' in model_type:
                 parameters.update({
                     'lstm_units': config.model.LSTM_UNITS,
                     'lstm_dropout': config.model.LSTM_DROPOUT,
+                    'lstm_learning_rate': config.model.LSTM_LEARNING_RATE,
                     'epochs': config.model.LSTM_EPOCHS,
-                    'batch_size': config.model.LSTM_BATCH_SIZE
+                    'batch_size': config.model.LSTM_BATCH_SIZE,
+                    'patience': config.model.LSTM_PATIENCE
                 })
             elif 'xgb' in model_type:
                 parameters.update({
                     'max_depth': config.model.XGB_MAX_DEPTH,
                     'learning_rate': config.model.XGB_LEARNING_RATE,
-                    'n_estimators': config.model.XGB_N_ESTIMATORS
+                    'n_estimators': config.model.XGB_N_ESTIMATORS,
+                    'subsample': config.model.XGB_SUBSAMPLE,
+                    'colsample_bytree': config.model.XGB_COLSAMPLE_BYTREE,
+                    'early_stopping_rounds': config.model.XGB_EARLY_STOPPING_ROUNDS
                 })
 
+            # Добавляем feature importance в метрики
+            if feature_importance:
+                metrics['feature_importance'] = feature_importance
+
             # Сохранение в базу данных
-            success = self.db.save_model_info(
+            self.db.save_model_info(
                 model_id=model_id,
                 symbol=symbol,
-                timeframe='5m',
+                timeframe=state_manager.get_selected_timeframe(),
                 model_type=model_type,
                 parameters=json.dumps(parameters),
                 metrics=json.dumps(metrics),
                 model_path=model_path,
+                feature_importance=json.dumps(feature_importance) if feature_importance else None,
                 verbose=verbose
             )
 
-            if success and verbose:
-                self.log(f"Model {model_id} saved successfully")
-                self.log(f"  Model file: {model_path}")
-                self.log(f"  Scaler file: {scaler_path}")
+            if verbose:
+                print(f"✅ Модель {model_id} сохранена успешно")
+                print(f"   Файл модели: {model_path}")
+                print(f"   Файл скейлера: {scaler_path}")
+                print(f"   Метрики: accuracy={metrics.get('accuracy', metrics.get('val_accuracy', 0)):.4f}")
 
-            return success
+            return True
 
         except Exception as e:
-            self.log(f"Error saving model: {e}", 'error')
+            print(f"❌ Ошибка сохранения модели: {e}")
             return False
 
     def load_model(self, model_id: str, verbose: bool = True) -> Tuple[Any, Any]:
         """
         Загрузка модели и скейлера
-
-        Args:
-            model_id: ID модели
-            verbose: Флаг логирования
-
-        Returns:
-            Модель и скейлер
         """
         try:
             # Проверка кеша
@@ -507,25 +848,28 @@ class ModelTrainer:
                 return self.model_cache[model_id]
 
             # Получение информации о модели из БД
-            models_df = self.db.get_available_models(model_id=model_id, verbose=verbose)
+            models_df = self.db.get_available_models(active_only=False, verbose=verbose)
 
             if models_df.empty:
                 self.log(f"Model {model_id} not found in database", 'error')
                 return None, None
 
-            model_info = models_df.iloc[0]
+            model_info = models_df[models_df['model_id'] == model_id]
+            if model_info.empty:
+                self.log(f"Model {model_id} not found in database", 'error')
+                return None, None
+
+            model_info = model_info.iloc[0]
             model_path = model_info['model_path']
             model_type = model_info['model_type']
 
             # Загрузка скейлера
             scaler_path = model_path.replace('.h5', '_scaler.pkl').replace('.pkl', '_scaler.pkl')
 
-            if not os.path.exists(scaler_path):
-                self.log(f"Scaler file not found: {scaler_path}", 'error')
-                return None, None
-
-            with open(scaler_path, 'rb') as f:
-                scaler = pickle.load(f)
+            scaler = None
+            if os.path.exists(scaler_path):
+                with open(scaler_path, 'rb') as f:
+                    scaler = pickle.load(f)
 
             # Загрузка модели
             model = None
@@ -539,22 +883,30 @@ class ModelTrainer:
                         if os.path.exists(keras_path):
                             model = load_model(keras_path)
             elif 'xgb' in model_type:
-                pkl_path = model_path.replace('.h5', '.pkl')
-                if os.path.exists(pkl_path):
-                    with open(pkl_path, 'rb') as f:
+                if os.path.exists(model_path):
+                    with open(model_path, 'rb') as f:
                         model = pickle.load(f)
 
             if model is None:
                 self.log(f"Failed to load model from {model_path}", 'error')
                 return None, None
 
+            # Восстанавливаем дополнительные атрибуты из метаданных
+            if 'metrics' in model_info and model_info['metrics']:
+                try:
+                    metrics = json.loads(model_info['metrics'])
+                    if 'feature_names' in metrics:
+                        model.feature_names = metrics['feature_names']
+                except:
+                    pass
+
             # Кеширование
             self.model_cache[model_id] = (model, scaler)
 
             if verbose:
-                self.log(f"Model {model_id} loaded successfully")
-                self.log(f"  Type: {model_type}")
-                self.log(f"  Path: {model_path}")
+                print(f"✅ Модель {model_id} загружена успешно")
+                print(f"   Тип: {model_type}")
+                print(f"   Путь: {model_path}")
 
             return model, scaler
 
@@ -562,177 +914,77 @@ class ModelTrainer:
             self.log(f"Error loading model: {e}", 'error')
             return None, None
 
-    def train_models(self, symbol: str = None, verbose: bool = True):
+    def prepare_sequences_with_features(self, df: pd.DataFrame, target_column: str,
+                                        lookback_window: int = 60,
+                                        use_advanced_features: bool = True,
+                                        verbose: bool = True) -> Tuple[np.ndarray, np.ndarray, List[str]]:
         """
-        Обучение моделей для указанного символа или всех символов
-
-        Args:
-            symbol: Торговая пара (если None - все символы)
-            verbose: Флаг логирования
-        """
-        try:
-            symbols = [symbol] if symbol else config.trading.SYMBOLS
-
-            for sym in symbols:
-                self.log(f"Training models for {sym}...")
-
-                # Обучение LSTM
-                lstm_model, lstm_metrics = self.train_lstm_classifier(
-                    symbol=sym,
-                    verbose=verbose
-                )
-
-                if lstm_model is not None:
-                    lstm_model_id = self.generate_model_id(sym, 'lstm_class')
-                    self.save_model(
-                        model=lstm_model,
-                        scaler=None,  # Скейлер сохраняется внутри train_lstm_classifier
-                        model_id=lstm_model_id,
-                        symbol=sym,
-                        model_type='lstm_class',
-                        metrics=lstm_metrics,
-                        verbose=verbose
-                    )
-
-                # Обучение XGBoost
-                xgb_model, xgb_metrics = self.train_xgboost_classifier(
-                    symbol=sym,
-                    verbose=verbose
-                )
-
-                if xgb_model is not None:
-                    xgb_model_id = self.generate_model_id(sym, 'xgb_class')
-                    self.save_model(
-                        model=xgb_model,
-                        scaler=None,  # Скейлер сохраняется внутри train_xgboost_classifier
-                        model_id=xgb_model_id,
-                        symbol=sym,
-                        model_type='xgb_class',
-                        metrics=xgb_metrics,
-                        verbose=verbose
-                    )
-
-                self.log(f"Models trained for {sym}")
-
-        except Exception as e:
-            self.log(f"Error training models: {e}", 'error')
-
-    def compare_models(self, symbol: str, verbose: bool = True) -> pd.DataFrame:
-        """
-        Сравнение моделей для символа
-
-        Args:
-            symbol: Торговая пара
-            verbose: Флаг логирования
-
-        Returns:
-            DataFrame с сравнением моделей
+        Создание последовательностей для обучения с возвратом имен фичей
         """
         try:
-            models_df = self.db.get_available_models(
-                symbol=symbol,
-                active_only=True,
-                verbose=verbose
-            )
+            # Базовые фичи
+            base_features = ['close', 'volume', 'returns']
 
-            if models_df.empty:
-                self.log(f"No models found for {symbol}", 'warning')
-                return pd.DataFrame()
+            # Технические индикаторы
+            tech_indicators = [col for col in df.columns
+                               if any(indicator in col for indicator in
+                                      ['SMA', 'EMA', 'RSI', 'MACD', 'BB', 'ATR', 'OBV', 'ADX'])]
 
-            # Парсинг метрик
-            comparison_data = []
-            for _, row in models_df.iterrows():
-                metrics = json.loads(row['metrics'])
+            # Расширенные фичи если нужно
+            advanced_features = []
+            if use_advanced_features:
+                advanced_features = [col for col in df.columns
+                                     if col.startswith('FEATURE_') or
+                                     any(x in col for x in
+                                         ['volatility', 'spread', 'skew', 'kurtosis', 'volume_profile'])]
 
-                if 'lstm' in row['model_type']:
-                    accuracy = metrics.get('val_accuracy', 0)
-                else:
-                    accuracy = metrics.get('accuracy', 0)
+            # Объединяем все фичи
+            feature_columns = base_features + tech_indicators + advanced_features
 
-                f1 = metrics.get('f1_score', 0)
+            # Оставляем только существующие колонки
+            feature_columns = [col for col in feature_columns if col in df.columns]
 
-                comparison_data.append({
-                    'model_id': row['model_id'],
-                    'model_type': row['model_type'],
-                    'accuracy': accuracy,
-                    'f1_score': f1,
-                    'created_at': row['created_at'],
-                    'training_samples': metrics.get('training_samples', 0),
-                    'class_distribution': metrics.get('class_distribution_train', {})
-                })
+            # Убираем NaN из фичей
+            df_features = df[feature_columns].copy()
 
-            comparison_df = pd.DataFrame(comparison_data)
+            # Заполняем NaN (forward fill, затем backward fill)
+            df_features = df_features.ffill().bfill()
 
-            if not comparison_df.empty:
-                comparison_df = comparison_df.sort_values('f1_score', ascending=False)
+            # Удаляем строки где все значения NaN
+            df_features = df_features.dropna(how='all')
 
-                if verbose:
-                    self.log(f"Model comparison for {symbol}:")
-                    for _, row in comparison_df.iterrows():
-                        self.log(f"  {row['model_id']}: {row['model_type']}, "
-                               f"Accuracy: {row['accuracy']:.4f}, F1: {row['f1_score']:.4f}")
+            if len(feature_columns) == 0:
+                print("   ❌ Нет фичей для обучения")
+                return np.array([]), np.array([]), []
 
-            return comparison_df
+            print(f"   🔍 Используется {len(feature_columns)} фичей")
+            if verbose:
+                print(f"   📋 Фичи: {', '.join(feature_columns[:10])}" +
+                      ("..." if len(feature_columns) > 10 else ""))
 
-        except Exception as e:
-            self.log(f"Error comparing models: {e}", 'error')
-            return pd.DataFrame()
+            # Создаем массивы
+            X = []
+            y = []
 
-    def batch_convert_models(self, symbol: str = None, verbose: bool = True) -> Dict:
-        """
-        Конвертация моделей H5 в Keras формат
+            data_features = df_features.values
+            data_target = df[target_column].values
 
-        Args:
-            symbol: Торговая пара
-            verbose: Флаг логирования
+            for i in range(lookback_window, len(df_features)):
+                X.append(data_features[i - lookback_window:i])
+                y.append(data_target[i])
 
-        Returns:
-            Словарь с результатами конвертации
-        """
-        try:
-            import tensorflow as tf
+            if len(X) == 0:
+                print("   ❌ Не удалось создать ни одной последовательности")
+                return np.array([]), np.array([]), []
 
-            if symbol:
-                models_df = self.db.get_available_models(symbol=symbol, verbose=verbose)
-            else:
-                models_df = self.db.get_available_models(verbose=verbose)
+            X_array = np.array(X)
+            y_array = np.array(y)
 
-            results = {'converted': 0, 'failed': 0, 'already_converted': 0}
+            print(f"   📐 Размерность X: {X_array.shape}")
+            print(f"   📐 Размерность y: {y_array.shape}")
 
-            for _, row in models_df.iterrows():
-                if 'lstm' not in row['model_type']:
-                    continue
-
-                model_path = row['model_path']
-                keras_path = model_path.replace('.h5', '.keras')
-
-                # Проверка существования
-                if os.path.exists(keras_path):
-                    if verbose:
-                        self.log(f"Keras model already exists: {keras_path}")
-                    results['already_converted'] += 1
-                    continue
-
-                # Конвертация
-                try:
-                    if os.path.exists(model_path):
-                        model = load_model(model_path)
-                        model.save(keras_path)
-
-                        if verbose:
-                            self.log(f"Converted: {model_path} -> {keras_path}")
-                        results['converted'] += 1
-                    else:
-                        if verbose:
-                            self.log(f"Source model not found: {model_path}", 'warning')
-                        results['failed'] += 1
-                except Exception as e:
-                    if verbose:
-                        self.log(f"Conversion failed for {model_path}: {e}", 'error')
-                    results['failed'] += 1
-
-            return results
+            return X_array, y_array, feature_columns
 
         except Exception as e:
-            self.log(f"Error converting models: {e}", 'error')
-            return {'converted': 0, 'failed': 0, 'already_converted': 0}
+            print(f"   ❌ Ошибка создания последовательностей: {e}")
+            return np.array([]), np.array([]), []

@@ -7,7 +7,7 @@ import pandas as pd
 import logging
 import json
 from datetime import datetime, timedelta
-from typing import Optional, List, Dict, Any
+from typing import Optional, Dict, Any
 from config import config
 
 
@@ -37,8 +37,6 @@ class Database:
                 self.logger.error(message)
             elif level == 'warning':
                 self.logger.warning(message)
-            elif level == 'debug':
-                self.logger.debug(message)
 
     def connect(self):
         """Подключение к базе данных"""
@@ -136,12 +134,6 @@ class Database:
     def store_historical_data(self, symbol: str, timeframe: str, data: pd.DataFrame, verbose: bool = True):
         """
         Сохранение исторических данных в базу
-
-        Args:
-            symbol: Торговая пара
-            timeframe: Таймфрейм
-            data: DataFrame с данными
-            verbose: Флаг логирование
         """
         try:
             if data.empty:
@@ -154,7 +146,6 @@ class Database:
 
             for idx, row in data.iterrows():
                 try:
-                    # Преобразуем Timestamp в строку для SQLite
                     timestamp_str = idx.strftime('%Y-%m-%d %H:%M:%S') if hasattr(idx, 'strftime') else str(idx)
 
                     cursor.execute('''
@@ -167,7 +158,6 @@ class Database:
                     if cursor.rowcount > 0:
                         added_count += 1
                     else:
-                        # Обновление существующей записи
                         cursor.execute('''
                             UPDATE historical_data 
                             SET open=?, high=?, low=?, close=?, volume=?
@@ -183,9 +173,7 @@ class Database:
 
             # Обновление метаданных
             last_timestamp = data.index.max()
-            last_timestamp_str = last_timestamp.strftime('%Y-%m-%d %H:%M:%S') if hasattr(last_timestamp,
-                                                                                         'strftime') else str(
-                last_timestamp)
+            last_timestamp_str = last_timestamp.strftime('%Y-%m-%d %H:%M:%S')
 
             cursor.execute('''
                 INSERT OR REPLACE INTO metadata (symbol, timeframe, last_update, last_candle_timestamp)
@@ -207,16 +195,6 @@ class Database:
                             verbose: bool = True) -> pd.DataFrame:
         """
         Получение исторических данных из базы
-
-        Args:
-            symbol: Торговая пара
-            timeframe: Таймфрейм
-            start_date: Начальная дата
-            end_date: Конечная дата
-            verbose: Флаг логирования
-
-        Returns:
-            DataFrame с историческими данными
         """
         try:
             query = '''
@@ -228,12 +206,10 @@ class Database:
 
             if start_date:
                 query += ' AND timestamp >= ?'
-                params.append(
-                    start_date.strftime('%Y-%m-%d %H:%M:%S') if hasattr(start_date, 'strftime') else str(start_date))
+                params.append(start_date.strftime('%Y-%m-%d %H:%M:%S'))
             if end_date:
                 query += ' AND timestamp <= ?'
-                params.append(
-                    end_date.strftime('%Y-%m-%d %H:%M:%S') if hasattr(end_date, 'strftime') else str(end_date))
+                params.append(end_date.strftime('%Y-%m-%d %H:%M:%S'))
 
             query += ' ORDER BY timestamp'
 
@@ -276,7 +252,7 @@ class Database:
             return None
 
     def save_model_info(self, model_id: str, symbol: str, timeframe: str,
-                        model_type: str, parameters: Dict, metrics: Dict,
+                        model_type: str, parameters: str, metrics: str,
                         model_path: str, verbose: bool = True):
         """Сохранение информации о модели"""
         try:
@@ -287,7 +263,7 @@ class Database:
                  parameters, metrics, model_path, is_active)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (model_id, symbol, timeframe, model_type, datetime.now(),
-                  json.dumps(parameters), json.dumps(metrics), model_path, 1))
+                  parameters, metrics, model_path, 1))
 
             self.conn.commit()
             if verbose:
@@ -340,20 +316,8 @@ class Database:
                 self.log(f"Error getting models: {str(e)}", 'error')
             return pd.DataFrame()
 
-    def deactivate_model(self, model_id: str, verbose: bool = True):
-        """Деактивация модели"""
-        try:
-            cursor = self.conn.cursor()
-            cursor.execute('UPDATE models SET is_active = 0 WHERE model_id = ?', (model_id,))
-            self.conn.commit()
-            if verbose:
-                self.log(f"Model deactivated")
-        except Exception as e:
-            if verbose:
-                self.log(f"Error deactivating model: {str(e)}", 'error')
-
     def save_backtest_result(self, result_data: Dict, verbose: bool = True):
-        """Сохранение результата бэктеста"""
+        """Сохранение результата бэктеста в БД"""
         try:
             cursor = self.conn.cursor()
             columns = ', '.join(result_data.keys())
@@ -406,60 +370,8 @@ class Database:
                 self.log(f"Error getting backtest results: {str(e)}", 'error')
             return pd.DataFrame()
 
-    def get_data_stats(self, symbol: str, timeframe: str, verbose: bool = True) -> Dict:
-        """Получение статистики данных"""
-        try:
-            cursor = self.conn.cursor()
-
-            # Количество записей
-            cursor.execute('SELECT COUNT(*) FROM historical_data WHERE symbol=? AND timeframe=?',
-                           (symbol, timeframe))
-            count = cursor.fetchone()[0]
-
-            # Диапазон дат
-            cursor.execute('SELECT MIN(timestamp), MAX(timestamp) FROM historical_data WHERE symbol=? AND timeframe=?',
-                           (symbol, timeframe))
-            min_date, max_date = cursor.fetchone()
-
-            stats = {
-                'symbol': symbol,
-                'timeframe': timeframe,
-                'count': count,
-                'min_date': pd.to_datetime(min_date) if min_date else None,
-                'max_date': pd.to_datetime(max_date) if max_date else None,
-                'days_span': None
-            }
-
-            if min_date and max_date:
-                days_span = (pd.to_datetime(max_date) - pd.to_datetime(min_date)).days
-                stats['days_span'] = days_span
-
-            if verbose:
-                self.log(f"Data stats: {stats}")
-
-            return stats
-
-        except Exception as e:
-            if verbose:
-                self.log(f"Error getting data stats: {str(e)}", 'error')
-            return {}
-
-    def close(self):
-        """Закрытие соединения с базой данных"""
-        if self.conn:
-            self.conn.close()
-            self.log("Database connection closed")
-
     def delete_model(self, model_id: str, verbose: bool = True) -> bool:
-        """Удаление модели из базы данных
-
-        Args:
-            model_id: ID модели для удаления
-            verbose: Флаг логирования
-
-        Returns:
-            True если удалено успешно, False в противном случае
-        """
+        """Удаление модели из базы данных"""
         try:
             cursor = self.conn.cursor()
 
@@ -489,16 +401,7 @@ class Database:
     def delete_all_models(self, symbol: Optional[str] = None,
                           model_type: Optional[str] = None,
                           verbose: bool = True) -> int:
-        """Удаление всех моделей или по фильтру
-
-        Args:
-            symbol: Фильтр по символу (если None - все символы)
-            model_type: Фильтр по типу модели (если None - все типы)
-            verbose: Флаг логирования
-
-        Returns:
-            Количество удаленных моделей
-        """
+        """Удаление всех моделей или по фильтру"""
         try:
             cursor = self.conn.cursor()
 
@@ -517,14 +420,6 @@ class Database:
             if conditions:
                 query += ' WHERE ' + ' AND '.join(conditions)
 
-            # Получаем количество перед удалением
-            count_query = 'SELECT COUNT(*) FROM models'
-            if conditions:
-                count_query += ' WHERE ' + ' AND '.join(conditions)
-
-            cursor.execute(count_query, params)
-            count_before = cursor.fetchone()[0]
-
             # Выполняем удаление
             cursor.execute(query, params)
             self.conn.commit()
@@ -532,9 +427,7 @@ class Database:
             deleted_rows = cursor.rowcount
 
             if verbose:
-                self.log(f"Deleted {deleted_rows} models. " +
-                         (f"Symbol: {symbol}" if symbol else "") +
-                         (f", Type: {model_type}" if model_type else ""))
+                self.log(f"Deleted {deleted_rows} models")
 
             return deleted_rows
 
@@ -542,3 +435,9 @@ class Database:
             if verbose:
                 self.log(f"Error deleting models: {str(e)}", 'error')
             return 0
+
+    def close(self):
+        """Закрытие соединения с базой данных"""
+        if self.conn:
+            self.conn.close()
+            self.log("Database connection closed")
