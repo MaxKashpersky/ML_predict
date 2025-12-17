@@ -1,0 +1,10 @@
+logs/
+data/
+tmp/
+__pycache__/
+.venv/
+models/
+.env
+info.md
+*.log
+*.json
