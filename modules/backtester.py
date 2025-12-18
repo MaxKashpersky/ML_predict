@@ -2,12 +2,9 @@
 Модуль для бэктестирования торговых стратегий
 """
 
-# ===== ДОБАВЬТЕ ЭТОТ БЛОК ПОСЛЕ ИМПОРТОВ =====
 import os
 import warnings
 import sys
-import io
-import contextlib
 import time
 import numpy as np
 import pandas as pd
@@ -59,9 +56,14 @@ class Backtester:
         self.take_profit_pct = config.trading.TAKE_PROFIT_PCT / 100
         self.slippage = getattr(config.backtest, 'SLIPPAGE', 0.0005)
 
+        # Новые параметры для управления капиталом
+        self.risk_per_trade = 0.02  # Риск 2% на сделку
+        self.max_positions = config.trading.MAX_POSITIONS  # Максимальное количество одновременных позиций
+        self.position_size_pct = config.trading.POSITION_SIZE_PCT / 100  # Размер позиции в %
+
         # Константы для пакетной обработки
-        self.LSTM_BATCH_SIZE = getattr(config.backtest, 'LSTM_BATCH_SIZE', 256)
-        self.PROGRESS_UPDATE_INTERVAL = getattr(config.backtest, 'PROGRESS_UPDATE_INTERVAL', 100)
+        self.LSTM_BATCH_SIZE = 256
+        self.PROGRESS_UPDATE_INTERVAL = 100
 
     def setup_logging(self):
         """Настройка логирования"""
@@ -159,8 +161,7 @@ class Backtester:
                 return pd.DataFrame()
 
             if verbose:
-                print(
-                    f"  📈 Данные с индикаторами: {len(data_with_indicators)} строк, {len(data_with_indicators.columns)} колонок")
+                print(f"  📈 Данные с индикаторами: {len(data_with_indicators)} строк, {len(data_with_indicators.columns)} колонок")
                 print(f"  🔤 Пример колонок: {list(data_with_indicators.columns[:10])}...")
 
             # Добавляем расширенные фичи если это LSTM модель
@@ -170,8 +171,7 @@ class Backtester:
                 )
 
                 if verbose:
-                    print(
-                        f"  🔧 Добавлены расширенные фичи: {len(data_with_indicators)} строк, {len(data_with_indicators.columns)} колонок")
+                    print(f"  🔧 Добавлены расширенные фичи: {len(data_with_indicators)} строк, {len(data_with_indicators.columns)} колонок")
 
             return data_with_indicators
 
@@ -232,13 +232,14 @@ class Backtester:
             if not self.verbose:
                 return
 
+            # Гарантируем, что прогресс-бар покажет 100%
+            if self.current < self.total:
+                self.update(self.total, force=True)
+
             elapsed_time = time.time() - self.start_time
             elapsed_str = self._format_time(elapsed_time)
 
-            if message:
-                sys.stdout.write(f'\r{message} │ Время: {elapsed_str}\n')
-            else:
-                sys.stdout.write(f'\r{self.prefix} завершено │ Время: {elapsed_str}\n')
+            sys.stdout.write(f'\r{self.prefix} │{self.fill * self.length}│ 100.0% {self.suffix} │ Время: {elapsed_str}\n')
             sys.stdout.flush()
 
         @staticmethod
@@ -254,6 +255,56 @@ class Backtester:
                 hours = seconds // 3600
                 minutes = (seconds % 3600) // 60
                 return f"{hours:.0f}ч {minutes:.0f}м"
+
+    def calculate_position_size(self, balance: float, entry_price: float, stop_loss_price: float) -> Tuple[float, float]:
+        """
+        Расчет размера позиции на основе управления капиталом
+
+        Returns:
+            Tuple[float, float]: (размер позиции в единицах, сумма сделки)
+        """
+        try:
+            # Риск на сделку в долларах
+            risk_amount = balance * self.risk_per_trade
+
+            # Расчет стоп-лосса в процентах от цены входа
+            stop_loss_distance = abs(entry_price - stop_loss_price) / entry_price
+
+            if stop_loss_distance <= 0:
+                stop_loss_distance = self.stop_loss_pct
+
+            # Размер позиции в долларах
+            position_value = risk_amount / stop_loss_distance
+
+            # Ограничиваем размер позиции процентом от баланса
+            max_position_value = balance * self.position_size_pct
+            position_value = min(position_value, max_position_value)
+
+            # Количество единиц
+            position_size = position_value / entry_price
+
+            return position_size, position_value
+
+        except Exception as e:
+            self.log(f"Error calculating position size: {e}", 'warning')
+            # Дефолтный расчет: 1% от баланса
+            position_value = balance * 0.01
+            position_size = position_value / entry_price
+            return position_size, position_value
+
+    def calculate_stop_loss_price(self, entry_price: float, signal: int) -> float:
+        """Расчет цены стоп-лосса"""
+        if signal == 1:  # LONG
+            return entry_price * (1 - self.stop_loss_pct)
+        else:  # SHORT
+            return entry_price * (1 + self.stop_loss_pct)
+
+    def calculate_take_profit_price(self, entry_price: float, signal: int) -> float:
+        """Расчет цены тейк-профита"""
+        if signal == 1:  # LONG
+            return entry_price * (1 + self.take_profit_pct)
+        else:  # SHORT
+            return entry_price * (1 - self.take_profit_pct)
 
     def generate_lstm_signals_batch(self, data: pd.DataFrame, model: Any, scaler: Any,
                                     feature_columns: List[str], lookback_window: int,
@@ -382,11 +433,36 @@ class Backtester:
                                  feature_columns: List[str], lookback_window: int,
                                  verbose: bool = True) -> pd.DataFrame:
         """
-        Генерация сигналов XGBoost
+        Генерация сигналов XGBoost с исправлением несовпадения фичей
         """
         try:
             if data.empty or model is None:
                 return pd.DataFrame()
+
+            # КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ 1: Получаем правильные фичи из модели
+            if hasattr(model, 'base_feature_names'):
+                # Берем фичи, на которых была обучена модель
+                model_features = model.base_feature_names
+                if verbose:
+                    print(f"  🔧 Модель обучена на {len(model_features)} фичах")
+
+                # Проверяем, какие фичи есть в данных
+                available_features = [f for f in model_features if f in data.columns]
+                missing_features = [f for f in model_features if f not in data.columns]
+
+                if verbose:
+                    print(f"  📊 Доступно фичей в данных: {len(available_features)}")
+                    if missing_features:
+                        print(f"  ⚠️  Отсутствуют {len(missing_features)} фичей: {missing_features[:5]}...")
+
+                # Создаем недостающие фичи с нулевыми значениями
+                for feature in missing_features:
+                    data[feature] = 0.0
+
+                if verbose:
+                    print(f"  ✅ Все фичи созданы. Теперь данных: {data.shape}")
+            else:
+                available_features = feature_columns
 
             total_points = len(data) - lookback_window
             if total_points <= 0:
@@ -394,6 +470,10 @@ class Backtester:
 
             if verbose:
                 print(f"  🌳 XGBoost: Генерация сигналов для {total_points} точек")
+                print(f"  📐 Базовых фичей: {len(available_features)}")
+                print(f"  🔄 Lookback window: {lookback_window}")
+                print(f"  🔢 Всего фичей для XGBoost: {len(available_features) * lookback_window}")
+
                 progress = self.ProgressBar(
                     total=total_points,
                     prefix='🌳 XGBoost предсказания',
@@ -405,47 +485,117 @@ class Backtester:
             signals = np.zeros(len(data))
             confidences = np.zeros(len(data))
 
+            # КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ 2: Используем правильный порядок фичей
+            # Порядок должен быть таким же, как при обучении
+            ordered_features = []
+            if hasattr(model, 'base_feature_names'):
+                ordered_features = model.base_feature_names
+            else:
+                ordered_features = available_features
+
+            processed_count = 0
+            error_count = 0
+
             for i in range(lookback_window, len(data)):
                 try:
-                    # Извлекаем окно данных
-                    window_data = data.iloc[i-lookback_window:i][feature_columns].values
+                    # Извлекаем окно данных с правильным порядком фичей
+                    window_data = data.iloc[i - lookback_window:i][ordered_features].values
 
-                    # Преобразуем в формат для XGBoost
+                    # Преобразуем в формат для XGBoost (2D)
                     X_window_flat = window_data.flatten().reshape(1, -1)
+
+                    if verbose and i == lookback_window:  # Первая итерация
+                        print(f"  📏 Размер окна: {window_data.shape} -> {X_window_flat.shape}")
+                        print(f"  🔢 Ожидается моделью: {len(model.feature_names)} фичей")
+
+                    # КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ 3: Проверяем и исправляем размерность
+                    expected_features = len(model.feature_names) if hasattr(model, 'feature_names') else X_window_flat.shape[1]
+
+                    if X_window_flat.shape[1] != expected_features:
+                        if verbose and i == lookback_window:
+                            print(f"  ⚠️  Несоответствие фичей: {X_window_flat.shape[1]} != {expected_features}")
+                            print(f"  🔧 Дополняем нулями...")
+
+                        # Дополняем нулями или обрезаем до нужного размера
+                        if X_window_flat.shape[1] < expected_features:
+                            # Дополняем нулями
+                            diff = expected_features - X_window_flat.shape[1]
+                            zeros = np.zeros((1, diff))
+                            X_window_flat = np.hstack([X_window_flat, zeros])
+                        else:
+                            # Обрезаем
+                            X_window_flat = X_window_flat[:, :expected_features]
 
                     # Нормализуем если есть скейлер
                     if scaler is not None:
                         try:
-                            X_norm = scaler.transform(X_window_flat)
+                            # Проверяем совместимость
+                            if hasattr(scaler, 'n_features_in_'):
+                                if X_window_flat.shape[1] != scaler.n_features_in_:
+                                    if verbose and i == lookback_window:
+                                        print(f"  ⚠️  Несоответствие со скейлером")
+                                        print(f"     Данные: {X_window_flat.shape[1]} фичей")
+                                        print(f"     Скейлер: {scaler.n_features_in_} фичей")
+
+                                    # Создаем совместимый массив
+                                    if X_window_flat.shape[1] < scaler.n_features_in_:
+                                        diff = scaler.n_features_in_ - X_window_flat.shape[1]
+                                        zeros = np.zeros((1, diff))
+                                        X_norm = np.hstack([X_window_flat, zeros])
+                                    else:
+                                        X_norm = X_window_flat[:, :scaler.n_features_in_]
+
+                                    X_norm = scaler.transform(X_norm)
+                                else:
+                                    X_norm = scaler.transform(X_window_flat)
+                            else:
+                                X_norm = scaler.transform(X_window_flat)
                         except Exception as e:
+                            if verbose and i == lookback_window:
+                                print(f"  ⚠️  Ошибка нормализации: {e}")
                             X_norm = X_window_flat
                     else:
                         X_norm = X_window_flat
 
                     # Предсказание
-                    prediction = model.predict(X_norm)
-                    predicted_class = int(prediction[0]) - 1  # Преобразуем [0,1,2] -> [-1,0,1]
+                    try:
+                        prediction = model.predict(X_norm)
+                        predicted_class = int(prediction[0]) - 1  # Преобразуем [0,1,2] -> [-1,0,1]
 
-                    # Получаем вероятность если возможно
-                    if hasattr(model, 'predict_proba'):
-                        proba = model.predict_proba(X_norm)
-                        confidence = np.max(proba[0])
-                    else:
-                        confidence = 0.5
+                        # Получаем вероятность если возможно
+                        if hasattr(model, 'predict_proba'):
+                            try:
+                                proba = model.predict_proba(X_norm)
+                                confidence = np.max(proba[0])
+                            except:
+                                confidence = 0.5
+                        else:
+                            confidence = 0.5
 
-                    signals[i] = predicted_class
-                    confidences[i] = confidence
+                        signals[i] = predicted_class
+                        confidences[i] = confidence
 
-                    if verbose and i % self.PROGRESS_UPDATE_INTERVAL == 0:
-                        progress.update(i)
+                        processed_count += 1
+
+                    except Exception as pred_error:
+                        if verbose and error_count < 3:  # Показываем только первые 3 ошибки
+                            print(f"  ⚠️  Ошибка предсказания: {pred_error}")
+                            error_count += 1
+                        continue
+
+                    if verbose and processed_count % self.PROGRESS_UPDATE_INTERVAL == 0:
+                        progress.update(processed_count)
 
                 except Exception as e:
-                    if verbose and i == lookback_window:
-                        print(f"  ⚠️ Ошибка предсказания: {e}")
+                    if verbose and error_count < 3:
+                        print(f"  ⚠️  Ошибка обработки: {e}")
+                        error_count += 1
                     continue
 
             if verbose:
                 progress.finish("✅ XGBoost предсказания завершены")
+                print(f"  ✅ Успешно обработано: {processed_count} точек")
+                print(f"  ❌ Ошибок: {error_count}")
 
             # Создаем DataFrame с результатами
             signals_df = data.copy()
@@ -461,13 +611,23 @@ class Backtester:
                 if len(valid_signals) > 0:
                     long_count = len(valid_signals[valid_signals['signal'] > 0])
                     short_count = len(valid_signals[valid_signals['signal'] < 0])
-                    print(f"  📈 LONG: {long_count}, SHORT: {short_count}")
+                    hold_count = len(valid_signals[valid_signals['signal'] == 0])
+                    print(f"  📈 LONG: {long_count}, SHORT: {short_count}, HOLD: {hold_count}")
+
+                    # Показываем примеры сигналов
+                    if len(valid_signals) > 5:
+                        print(f"  📊 Примеры сигналов:")
+                        for idx, row in valid_signals.head(3).iterrows():
+                            signal_type = "LONG" if row['signal'] > 0 else "SHORT" if row['signal'] < 0 else "HOLD"
+                            print(f"    {idx}: {signal_type} (уверенность: {row['confidence']:.2f})")
 
             return valid_signals
 
         except Exception as e:
             if verbose:
                 print(f"  ❌ Ошибка генерации XGBoost сигналов: {e}")
+                import traceback
+                traceback.print_exc()
             return pd.DataFrame()
 
     def generate_backtest_signals_optimized(self, data: pd.DataFrame, model: Any, scaler: Any,
@@ -516,19 +676,25 @@ class Backtester:
 
     def get_model_features(self, model: Any, data: pd.DataFrame, verbose: bool = True) -> List[str]:
         """
-        Получение фичей из модели
+        Получение фичей из модели для XGBoost
         """
         try:
-            # Пытаемся получить фичи из атрибутов модели
+            # Для XGBoost используем базовые фичи, на которых была обучена модель
             if hasattr(model, 'base_feature_names'):
                 feature_columns = model.base_feature_names
+                if verbose:
+                    print(f"  🔧 Используем базовые фичи модели: {len(feature_columns)} фичей")
             elif hasattr(model, '_features'):
                 feature_columns = model._features
             elif hasattr(model, 'feature_names'):
+                # Если это расширенные фичи с лагами, извлекаем базовые
                 feature_columns = model.feature_names
 
-                # Если это расширенные фичи с лагами, извлекаем базовые
                 if feature_columns and any('_t-' in str(f) for f in feature_columns[:10]):
+                    if verbose:
+                        print(f"  🔍 Обнаружены расширенные фичи с лагами")
+
+                    # Извлекаем уникальные базовые фичи
                     base_features = set()
                     for feature in feature_columns:
                         if isinstance(feature, str) and '_t-' in feature:
@@ -536,27 +702,49 @@ class Backtester:
                             base_features.add(base_feature)
                         else:
                             base_features.add(str(feature))
+
                     feature_columns = list(base_features)
+                    if verbose:
+                        print(f"  🔧 Извлечено {len(feature_columns)} базовых фичей")
             else:
                 # Дефолтный набор фичей
-                base_features = ['close', 'volume', 'returns']
+                if verbose:
+                    print(f"  ⚠️  Используем дефолтный набор фичей")
+
+                # Основные OHLCV
+                base_features = ['open', 'high', 'low', 'close', 'volume', 'returns']
+
+                # Технические индикаторы
                 tech_indicators = [col for col in data.columns
-                                  if any(indicator in col.lower() for indicator in
-                                        ['sma', 'ema', 'rsi', 'macd', 'bb', 'atr', 'obv', 'adx'])]
-                feature_columns = base_features + tech_indicators
+                                   if any(indicator in col.lower() for indicator in
+                                          ['sma', 'ema', 'rsi', 'macd', 'bb', 'atr', 'obv', 'adx', 'stoch',
+                                           'williams'])]
+
+                # Расширенные фичи (без временных)
+                advanced_features = [col for col in data.columns
+                                     if not any(temp in col.lower() for temp in ['hour', 'day', 'month', 'week'])
+                                     and not col.startswith('TARGET_')
+                                     and col not in base_features + tech_indicators]
+
+                feature_columns = base_features + tech_indicators + advanced_features[:20]  # Ограничиваем количество
 
             # Фильтруем только существующие в данных
             feature_columns = [col for col in feature_columns if col in data.columns]
+
+            # Добавляем недостающие фичи (создаем с нулями)
+            missing_features = [col for col in feature_columns if col not in data.columns]
+            if missing_features and verbose:
+                print(f"  ⚠️  Отсутствуют {len(missing_features)} фичей")
 
             # Сортируем для consistency
             feature_columns = sorted(feature_columns)
 
             if verbose:
                 print(f"  📋 Найдено {len(feature_columns)} фичей")
-                if len(feature_columns) <= 10:
+                if len(feature_columns) <= 15:
                     print(f"  📋 Фичи: {feature_columns}")
                 else:
-                    print(f"  📋 Первые 10 фичей: {feature_columns[:10]}...")
+                    print(f"  📋 Первые 15 фичей: {feature_columns[:15]}...")
 
             return feature_columns
 
@@ -565,8 +753,23 @@ class Backtester:
                 print(f"  ⚠️ Ошибка получения фичей из модели: {e}")
             return []
 
+    def calculate_max_consecutive(self, trades: List[Dict], result_type: str) -> int:
+        """Расчет максимальной серии побед или поражений"""
+        max_streak = 0
+        current_streak = 0
+
+        for trade in trades:
+            if trade.get('result') == result_type:
+                current_streak += 1
+                max_streak = max(max_streak, current_streak)
+            else:
+                current_streak = 0
+
+        return max_streak
+
     def execute_backtest(self, signals: pd.DataFrame, initial_balance: float,
-                        commission: float, verbose: bool = True) -> Dict[str, Any]:
+                        commission: float, verbose: bool = True,
+                        show_all_trades: bool = False) -> Dict[str, Any]:
         """
         Выполнение бэктеста на основе сигналов
         """
@@ -578,14 +781,23 @@ class Backtester:
             balance = initial_balance
             position = 0.0  # 0 = нет позиции, >0 = LONG, <0 = SHORT
             entry_price = 0.0
+            position_size = 0.0
+            position_value = 0.0
             trade_history = []
+            open_positions = []
+            balance_history = []
+
             peak_balance = initial_balance
             max_drawdown = 0.0
+            total_commission_paid = 0.0
 
             if verbose:
                 print(f"\n💼 ВЫПОЛНЕНИЕ БЭКТЕСТА")
                 print(f"  💰 Начальный баланс: ${initial_balance:,.2f}")
                 print(f"  📊 Всего сигналов: {len(signals)}")
+                print(f"  🎯 Риск на сделку: {self.risk_per_trade*100:.1f}%")
+                print(f"  📈 Макс. позиций: {self.max_positions}")
+
                 progress = self.ProgressBar(
                     total=len(signals),
                     prefix='💼 Выполнение сделок',
@@ -593,34 +805,72 @@ class Backtester:
                     verbose=verbose
                 )
 
+            # Записываем начальный баланс
+            balance_history.append({
+                'timestamp': signals.index[0] if not signals.empty else datetime.now(),
+                'balance': balance,
+                'open_positions': 0
+            })
+
             for i, (timestamp, row) in enumerate(signals.iterrows()):
                 try:
                     current_price = row['close']
                     signal = int(row['signal'])
-                    confidence = row['confidence']
+                    confidence = row.get('confidence', 0.5)
 
                     # Логика торговли
                     if position == 0 and signal != 0:  # Открытие позиции
                         position = signal  # 1 для LONG, -1 для SHORT
                         entry_price = current_price
 
+                        # Расчет размера позиции
+                        stop_loss_price = self.calculate_stop_loss_price(entry_price, signal)
+                        position_size, position_value = self.calculate_position_size(
+                            balance, entry_price, stop_loss_price
+                        )
+
+                        # Списываем стоимость позиции из баланса
+                        balance -= position_value
+
                         trade = {
                             'timestamp': timestamp,
                             'type': 'LONG' if signal == 1 else 'SHORT',
                             'entry_price': entry_price,
+                            'position_size': position_size,
+                            'position_value': position_value,
+                            'stop_loss': stop_loss_price,
+                            'take_profit': self.calculate_take_profit_price(entry_price, signal),
+                            'entry_balance': balance + position_value,  # Баланс до открытия
                             'exit_price': None,
-                            'entry_balance': balance,
                             'exit_balance': None,
                             'pnl': None,
                             'pnl_pct': None,
+                            'pnl_abs': None,
                             'duration': None,
                             'result': 'OPEN',
-                            'confidence': confidence
+                            'close_reason': None,
+                            'confidence': confidence,
+                            'commission': 0,
+                            'current_balance': balance,
+                            'status': 'OPEN'
                         }
                         trade_history.append(trade)
 
-                        if verbose and len(trade_history) <= 5:
-                            print(f"  📈 Открыта {trade['type']} позиция по ${entry_price:.4f}")
+                        open_positions.append({
+                            'trade_index': len(trade_history) - 1,
+                            'type': 'LONG' if signal == 1 else 'SHORT',
+                            'entry_price': entry_price,
+                            'position_size': position_size,
+                            'position_value': position_value
+                        })
+
+                        if verbose and (show_all_trades or len(trade_history) <= 10):
+                            color = "\033[92m" if signal == 1 else "\033[91m"
+                            reset = "\033[0m"
+                            print(f"  {color}📈 Открыта {trade['type']} позиция по ${entry_price:.4f}{reset}")
+                            print(f"     Размер: {position_size:.2f} единиц (${position_value:,.2f})")
+                            print(f"     Стоп-лосс: ${stop_loss_price:.4f}")
+                            print(f"     Тейк-профит: ${trade['take_profit']:.4f}")
 
                     elif position != 0:  # Есть открытая позиция
                         # Расчет P&L
@@ -629,7 +879,7 @@ class Backtester:
                         else:  # SHORT позиция
                             pnl_pct = (entry_price - current_price) / entry_price
 
-                        pnl = balance * pnl_pct
+                        pnl_abs = position_value * pnl_pct
 
                         # Проверка стоп-лосса и тейк-профита
                         close_trade = False
@@ -641,44 +891,63 @@ class Backtester:
                         elif pnl_pct >= self.take_profit_pct:
                             close_trade = True
                             close_reason = "TAKE PROFIT"
-                        elif signal == -position:  # Противоположный сигнал
+                        elif signal == -position and len(open_positions) < self.max_positions:  # Противоположный сигнал
                             close_trade = True
                             close_reason = "REVERSE SIGNAL"
 
                         if close_trade:
                             # Закрытие позиции
-                            exit_balance = balance + pnl
+                            exit_value = position_value + pnl_abs
 
                             # Учитываем комиссию
-                            commission_fee = exit_balance * commission
-                            exit_balance -= commission_fee
+                            commission_fee = exit_value * commission
+                            exit_value -= commission_fee
+                            total_commission_paid += commission_fee
 
-                            # Обновляем баланс
-                            balance = exit_balance
+                            # Возвращаем средства на баланс
+                            balance += exit_value
 
                             # Обновляем историю сделки
                             trade = trade_history[-1]
                             trade['exit_price'] = current_price
-                            trade['exit_balance'] = exit_balance
-                            trade['pnl'] = pnl
+                            trade['exit_balance'] = balance
+                            trade['pnl'] = pnl_abs
                             trade['pnl_pct'] = pnl_pct * 100
+                            trade['pnl_abs'] = pnl_abs
                             trade['duration'] = (timestamp - trade['timestamp']).total_seconds() / 3600  # в часах
-                            trade['result'] = 'WIN' if pnl > 0 else 'LOSS'
+                            trade['result'] = 'WIN' if pnl_abs > 0 else 'LOSS'
                             trade['close_reason'] = close_reason
+                            trade['commission'] = commission_fee
+                            trade['current_balance'] = balance
+                            trade['status'] = 'CLOSED'
 
                             # Сбрасываем позицию
                             position = 0
                             entry_price = 0.0
+                            position_size = 0.0
+                            position_value = 0.0
+                            open_positions.pop()
 
-                            if verbose and len(trade_history) <= 5:
-                                result_emoji = "✅" if pnl > 0 else "❌"
-                                print(f"  {result_emoji} Закрыта позиция: P&L ${pnl:+.2f} ({pnl_pct*100:+.2f}%) - {close_reason}")
+                            if verbose and (show_all_trades or len([t for t in trade_history if t.get('status') == 'CLOSED']) <= 10):
+                                result_emoji = "✅" if pnl_abs > 0 else "❌"
+                                pnl_color = "\033[92m" if pnl_abs > 0 else "\033[91m"
+                                reset = "\033[0m"
+                                print(f"  {result_emoji} {pnl_color}Закрыта позиция: "
+                                      f"P&L ${pnl_abs:+,.2f} ({pnl_pct*100:+.2f}%) - {close_reason}{reset}")
+
+                    # Обновляем баланс в истории
+                    current_total_balance = balance + sum(p['position_value'] for p in open_positions)
+                    balance_history.append({
+                        'timestamp': timestamp,
+                        'balance': current_total_balance,
+                        'open_positions': len(open_positions)
+                    })
 
                     # Обновляем максимальную просадку
-                    if balance > peak_balance:
-                        peak_balance = balance
+                    if current_total_balance > peak_balance:
+                        peak_balance = current_total_balance
 
-                    current_drawdown = (peak_balance - balance) / peak_balance * 100
+                    current_drawdown = (peak_balance - current_total_balance) / peak_balance * 100
                     if current_drawdown > max_drawdown:
                         max_drawdown = current_drawdown
 
@@ -700,44 +969,61 @@ class Backtester:
                 else:  # SHORT
                     pnl_pct = (entry_price - last_price) / entry_price
 
-                pnl = balance * pnl_pct
-                exit_balance = balance + pnl
-                commission_fee = exit_balance * commission
-                exit_balance -= commission_fee
-                balance = exit_balance
+                pnl_abs = position_value * pnl_pct
+                exit_value = position_value + pnl_abs
+                commission_fee = exit_value * commission
+                exit_value -= commission_fee
+                total_commission_paid += commission_fee
+                balance += exit_value
 
                 trade['exit_price'] = last_price
-                trade['exit_balance'] = exit_balance
-                trade['pnl'] = pnl
+                trade['exit_balance'] = balance
+                trade['pnl'] = pnl_abs
                 trade['pnl_pct'] = pnl_pct * 100
+                trade['pnl_abs'] = pnl_abs
                 trade['duration'] = (signals.index[-1] - trade['timestamp']).total_seconds() / 3600
-                trade['result'] = 'WIN' if pnl > 0 else 'LOSS'
+                trade['result'] = 'WIN' if pnl_abs > 0 else 'LOSS'
                 trade['close_reason'] = 'END OF PERIOD'
+                trade['commission'] = commission_fee
+                trade['current_balance'] = balance
+                trade['status'] = 'CLOSED'
 
                 if verbose:
-                    result_emoji = "✅" if pnl > 0 else "❌"
-                    print(f"  {result_emoji} Позиция закрыта в конце периода: P&L ${pnl:+.2f} ({pnl_pct*100:+.2f}%)")
+                    result_emoji = "✅" if pnl_abs > 0 else "❌"
+                    pnl_color = "\033[92m" if pnl_abs > 0 else "\033[91m"
+                    reset = "\033[0m"
+                    print(f"  {result_emoji} {pnl_color}Позиция закрыта в конце периода: "
+                          f"P&L ${pnl_abs:+,.2f} ({pnl_pct*100:+.2f}%){reset}")
 
             if verbose:
                 progress.finish("✅ Бэктест выполнен")
 
             # Расчет итоговых метрик
-            total_trades = len([t for t in trade_history if t['result'] in ['WIN', 'LOSS']])
-            winning_trades = len([t for t in trade_history if t['result'] == 'WIN'])
-            losing_trades = len([t for t in trade_history if t['result'] == 'LOSS'])
+            closed_trades = [t for t in trade_history if t.get('status') == 'CLOSED']
+            total_trades = len(closed_trades)
+            winning_trades = len([t for t in closed_trades if t['result'] == 'WIN'])
+            losing_trades = len([t for t in closed_trades if t['result'] == 'LOSS'])
 
             win_rate = (winning_trades / total_trades * 100) if total_trades > 0 else 0
 
-            total_pnl = sum([t['pnl'] or 0 for t in trade_history])
+            total_pnl = sum([t.get('pnl', 0) or 0 for t in closed_trades])
             total_return = (balance - initial_balance) / initial_balance * 100
 
-            winning_pnl = sum([t['pnl'] or 0 for t in trade_history if t['result'] == 'WIN'])
-            losing_pnl = sum([t['pnl'] or 0 for t in trade_history if t['result'] == 'LOSS'])
+            winning_pnl = sum([t.get('pnl', 0) or 0 for t in closed_trades if t['result'] == 'WIN'])
+            losing_pnl = sum([t.get('pnl', 0) or 0 for t in closed_trades if t['result'] == 'LOSS'])
 
             profit_factor = abs(winning_pnl / losing_pnl) if losing_pnl != 0 else float('inf')
 
-            avg_win = np.mean([t['pnl'] or 0 for t in trade_history if t['result'] == 'WIN']) if winning_trades > 0 else 0
-            avg_loss = np.mean([t['pnl'] or 0 for t in trade_history if t['result'] == 'LOSS']) if losing_trades > 0 else 0
+            avg_win = np.mean([t.get('pnl', 0) or 0 for t in closed_trades if t['result'] == 'WIN']) if winning_trades > 0 else 0
+            avg_loss = np.mean([t.get('pnl', 0) or 0 for t in closed_trades if t['result'] == 'LOSS']) if losing_trades > 0 else 0
+
+            # Расчет дополнительных метрик
+            win_loss_ratio = abs(avg_win / avg_loss) if avg_loss != 0 else float('inf')
+            expected_value = (win_rate/100 * avg_win) + ((100-win_rate)/100 * avg_loss)
+
+            # Расчет максимальной серии убытков/прибылей
+            max_consecutive_wins = self.calculate_max_consecutive(closed_trades, 'WIN')
+            max_consecutive_losses = self.calculate_max_consecutive(closed_trades, 'LOSS')
 
             # Подготовка результатов
             results = {
@@ -753,7 +1039,14 @@ class Backtester:
                 'max_drawdown': max_drawdown,
                 'avg_win': avg_win,
                 'avg_loss': avg_loss,
+                'win_loss_ratio': win_loss_ratio,
+                'expected_value': expected_value,
+                'max_consecutive_wins': max_consecutive_wins,
+                'max_consecutive_losses': max_consecutive_losses,
+                'total_commission': total_commission_paid,
                 'trade_history': trade_history,
+                'balance_history': balance_history,
+                'open_positions_at_end': len(open_positions),
                 'summary': {
                     'aggregated': {
                         'total_return': total_return,
@@ -766,25 +1059,140 @@ class Backtester:
                         'profit_factor': profit_factor,
                         'max_drawdown': max_drawdown,
                         'avg_win': avg_win,
-                        'avg_loss': avg_loss
+                        'avg_loss': avg_loss,
+                        'win_loss_ratio': win_loss_ratio,
+                        'expected_value': expected_value,
+                        'max_consecutive_wins': max_consecutive_wins,
+                        'max_consecutive_losses': max_consecutive_losses
                     }
                 }
             }
 
             if verbose:
-                print(f"\n📊 РЕЗУЛЬТАТЫ БЭКТЕСТА:")
-                print(f"  💰 Конечный баланс: ${balance:,.2f}")
-                print(f"  📈 Общая доходность: {total_return:.2f}%")
-                print(f"  🎯 Win Rate: {win_rate:.1f}% ({winning_trades}/{total_trades})")
-                print(f"  📊 Макс. просадка: {max_drawdown:.2f}%")
-                print(f"  ⚖️  Profit Factor: {profit_factor:.2f}")
-                print(f"  📊 Всего сделок: {total_trades}")
+                self.print_detailed_report(results, show_all_trades)
 
             return results
 
         except Exception as e:
             self.log(f"Error executing backtest: {str(e)}", 'error')
             return {'error': str(e)}
+
+    def print_detailed_report(self, results: Dict[str, Any], show_all_trades: bool = False):
+        """Печать детализированного отчета о бэктесте"""
+        print(f"\n{'='*80}")
+        print("📊 ДЕТАЛИЗИРОВАННЫЙ ОТЧЕТ О БЭКТЕСТЕ")
+        print(f"{'='*80}")
+
+        # Основные результаты с цветовым кодированием
+        total_return = results['total_return']
+        return_color = "\033[92m" if total_return > 0 else "\033[91m"
+        reset_color = "\033[0m"
+
+        print(f"\n💰 ОСНОВНЫЕ РЕЗУЛЬТАТЫ:")
+        print(f"   Начальный баланс: ${results['initial_balance']:,.2f}")
+        print(f"   Конечный баланс:  ${results['final_balance']:,.2f}")
+        print(f"   Общая доходность: {return_color}{total_return:+.2f}%{reset_color}")
+        print(f"   Общий P&L:       ${results['total_pnl']:+,.2f}")
+        print(f"   Макс. просадка:  {results['max_drawdown']:.2f}%")
+        print(f"   Всего комиссий:  ${results['total_commission']:,.2f}")
+
+        print(f"\n🎯 СТАТИСТИКА СДЕЛОК:")
+        print(f"   Всего сделок:     {results['total_trades']}")
+        print(f"   Выигрышных:       {results['winning_trades']} ({results['win_rate']:.1f}%)")
+        print(f"   Проигрышных:      {results['losing_trades']} ({100 - results['win_rate']:.1f}%)")
+        print(f"   Profit Factor:    {results['profit_factor']:.2f}")
+        print(f"   Win/Loss Ratio:   {results['win_loss_ratio']:.2f}")
+        print(f"   Ожидаемое значение: ${results['expected_value']:+.2f}")
+        print(f"   Макс. серия побед: {results['max_consecutive_wins']}")
+        print(f"   Макс. серия поражений: {results['max_consecutive_losses']}")
+
+        print(f"\n📈 СРЕДНИЕ ПОКАЗАТЕЛИ:")
+        print(f"   Средний выигрыш:  ${results['avg_win']:+,.2f}")
+        print(f"   Средний проигрыш: ${results['avg_loss']:+,.2f}")
+
+        # Распределение прибылей/убытков
+        if results['total_trades'] > 0:
+            pnl_values = [t.get('pnl', 0) or 0 for t in results['trade_history'] if t.get('status') == 'CLOSED']
+            if pnl_values:
+                print(f"\n📊 РАСПРЕДЕЛЕНИЕ P&L:")
+                print(f"   Минимальный P&L: ${min(pnl_values):+,.2f}")
+                print(f"   Максимальный P&L: ${max(pnl_values):+,.2f}")
+                print(f"   Медиана P&L:     ${np.median(pnl_values):+,.2f}")
+                print(f"   Стандартное отклонение: ${np.std(pnl_values):,.2f}")
+
+        # Подробный список сделок
+        if show_all_trades and results['trade_history']:
+            closed_trades = [t for t in results['trade_history'] if t.get('status') == 'CLOSED']
+            if closed_trades:
+                print(f"\n📋 ПОДРОБНЫЙ СПИСОК СДЕЛОК ({len(closed_trades)} сделок):")
+                print(f"{'-'*130}")
+                print(f"{'Время':<20} {'Тип':<6} {'Вход':<8} {'Выход':<8} {'P&L':<12} {'P&L%':<8} {'Размер':<10} {'Результат':<10} {'Причина':<20} {'Баланс':<12}")
+                print(f"{'-'*130}")
+
+                for trade in closed_trades:
+                    timestamp = trade['timestamp'].strftime('%Y-%m-%d %H:%M')
+                    pnl = trade.get('pnl', 0) or 0
+                    pnl_color = "\033[92m" if pnl > 0 else "\033[91m" if pnl < 0 else ""
+                    reset = "\033[0m"
+
+                    print(f"{timestamp:<20} {trade['type']:<6} "
+                          f"${trade['entry_price']:<7.4f} ${trade.get('exit_price', 0):<7.4f} "
+                          f"{pnl_color}${pnl:<+11,.2f}{reset} {trade.get('pnl_pct', 0):<+7.2f}% "
+                          f"{trade.get('position_size', 0):<9.2f} {trade['result']:<10} "
+                          f"{trade.get('close_reason', 'N/A')[:18]:<20} "
+                          f"${trade.get('current_balance', 0):<11,.2f}")
+
+        elif results['trade_history']:
+            # Показываем только первые и последние 5 сделок
+            closed_trades = [t for t in results['trade_history'] if t.get('status') == 'CLOSED']
+            if len(closed_trades) > 10:
+                print(f"\n📊 ПЕРВЫЕ 5 И ПОСЛЕДНИЕ 5 СДЕЛОК:")
+                self.print_trades_table(closed_trades[:5], "Первые 5 сделок:")
+                self.print_trades_table(closed_trades[-5:], "Последние 5 сделок:")
+            elif closed_trades:
+                self.print_trades_table(closed_trades, "Все сделки:")
+
+        # Рекомендации
+        print(f"\n💡 РЕКОМЕНДАЦИИ:")
+        if total_return > 20:
+            print("   🎉 Отличные результаты! Модель показывает высокую эффективность")
+            print("   💡 Рассмотрите увеличение размера позиций")
+        elif total_return > 5:
+            print("   👍 Хорошие результаты, можно использовать для торговли")
+            print("   ⚠️  Проверьте максимальную просадку")
+        elif total_return > -5:
+            print("   ⚠️  Результаты нейтральные, требуется доработка модели")
+            print("   🔍 Проанализируйте распределение сделок")
+        else:
+            print("   ❌ Низкая эффективность, требуется переобучение модели")
+            print("   🛑 Рассмотрите использование других параметров или символов")
+
+        # Диагностика
+        if results['win_rate'] > 50 and total_return < 0:
+            print(f"\n🔍 ДИАГНОСТИКА:")
+            print(f"   ⚠️  Высокий Win Rate ({results['win_rate']:.1f}%), но отрицательная доходность")
+            print(f"   📊 Средний выигрыш: ${results['avg_win']:+,.2f}, Средний проигрыш: ${results['avg_loss']:+,.2f}")
+            print(f"   💡 Возможно, проигрышные сделки крупнее выигрышных")
+
+        print(f"\n{'='*80}")
+
+    def print_trades_table(self, trades: List[Dict], title: str):
+        """Печать таблицы сделок"""
+        print(f"\n{title}")
+        print(f"{'-'*100}")
+        print(f"{'Время':<18} {'Тип':<6} {'Вход':<8} {'Выход':<8} {'P&L':<10} {'Размер':<8} {'Результат':<10} {'Причина':<15}")
+        print(f"{'-'*100}")
+
+        for trade in trades:
+            timestamp = trade['timestamp'].strftime('%m-%d %H:%M')
+            pnl = trade.get('pnl', 0) or 0
+            pnl_color = "\033[92m" if pnl > 0 else "\033[91m" if pnl < 0 else ""
+            reset = "\033[0m"
+
+            print(f"{timestamp:<18} {trade['type']:<6} "
+                  f"${trade['entry_price']:<7.4f} ${trade.get('exit_price', 0):<7.4f} "
+                  f"{pnl_color}${pnl:<+9,.2f}{reset} {trade.get('position_size', 0):<7.2f} "
+                  f"{trade['result']:<10} {trade.get('close_reason', 'N/A')[:13]:<15}")
 
     def save_backtest_results(self, results: Dict[str, Any], symbol: str, model_id: Optional[str] = None):
         """
@@ -836,11 +1244,53 @@ class Backtester:
             self.log(f"Error saving backtest results: {str(e)}", 'error')
             return False
 
+    def determine_model_type(self, model: Any, verbose: bool = True) -> str:
+        """
+        Определение типа модели
+        """
+        model_type = 'unknown'
+
+        try:
+            if hasattr(model, 'get_booster'):
+                model_type = 'xgb'
+            elif hasattr(model, 'name') and 'lstm' in str(model.name).lower():
+                model_type = 'lstm'
+            elif 'xgb' in str(type(model)).lower():
+                model_type = 'xgb'
+            elif 'lstm' in str(type(model)).lower():
+                model_type = 'lstm'
+            else:
+                # Пытаемся определить по другим признакам
+                try:
+                    import xgboost
+                    if isinstance(model, xgboost.XGBClassifier) or isinstance(model, xgboost.XGBRegressor):
+                        model_type = 'xgb'
+                except:
+                    pass
+
+                try:
+                    import tensorflow as tf
+                    if isinstance(model, tf.keras.Model):
+                        model_type = 'lstm'
+                except:
+                    pass
+
+            if verbose and model_type == 'unknown':
+                print(f"  ⚠️  Не удалось определить тип модели, используется по умолчанию")
+
+            return model_type
+
+        except Exception as e:
+            if verbose:
+                print(f"  ⚠️  Ошибка определения типа модели: {e}")
+            return 'unknown'
+
     def run_comprehensive_backtest(self, symbol: str,
                                  initial_balance: float = 10000.0,
                                  commission: float = None,
                                  model_id: str = None,
-                                 verbose: bool = True) -> Dict[str, Any]:
+                                 verbose: bool = True,
+                                 show_all_trades: bool = False) -> Dict[str, Any]:
         """
         Комплексный бэктест для модели
         """
@@ -853,6 +1303,7 @@ class Backtester:
                     print(f"  📈 Комиссия: {commission * 100:.2f}%")
                 else:
                     print(f"  📈 Комиссия: {self.commission * 100:.2f}%")
+                print(f"  📊 Показывать все сделки: {'Да' if show_all_trades else 'Нет'}")
 
             # Устанавливаем комиссию если предоставлена
             if commission is not None:
@@ -862,7 +1313,7 @@ class Backtester:
             start_date, end_date = self.state_manager.get_backtest_dates()
 
             if verbose:
-                print(f"  📅 Период: {start_date} - {end_date}")
+                print(f"  📅 Период: {start_date.date()} - {end_date.date()}")
 
             # Получаем данные для бэктеста
             data = self.db.get_historical_data(
@@ -920,12 +1371,13 @@ class Backtester:
                     print("❌ Не удалось сгенерировать сигналы")
                 return {'error': 'Failed to generate signals'}
 
-            # Выполняем бэктест
+            # Выполняем бэктест с новым параметром
             results = self.execute_backtest(
                 signals=signals,
                 initial_balance=initial_balance,
                 commission=self.commission,
-                verbose=verbose
+                verbose=verbose,
+                show_all_trades=show_all_trades
             )
 
             # Сохраняем результаты
@@ -944,83 +1396,3 @@ class Backtester:
                 import traceback
                 traceback.print_exc()
             return {'error': error_msg}
-
-    def determine_model_type(self, model: Any, verbose: bool = True) -> str:
-        """
-        Определение типа модели
-        """
-        model_type = 'unknown'
-
-        try:
-            if hasattr(model, 'get_booster'):
-                model_type = 'xgb'
-            elif hasattr(model, 'name') and 'lstm' in str(model.name).lower():
-                model_type = 'lstm'
-            elif 'xgb' in str(type(model)).lower():
-                model_type = 'xgb'
-            elif 'lstm' in str(type(model)).lower():
-                model_type = 'lstm'
-            else:
-                # Пытаемся определить по другим признакам
-                try:
-                    import xgboost
-                    if isinstance(model, xgboost.XGBClassifier) or isinstance(model, xgboost.XGBRegressor):
-                        model_type = 'xgb'
-                except:
-                    pass
-
-                try:
-                    import tensorflow as tf
-                    if isinstance(model, tf.keras.Model):
-                        model_type = 'lstm'
-                except:
-                    pass
-
-            if verbose and model_type == 'unknown':
-                print(f"  ⚠️  Не удалось определить тип модели, используется по умолчанию")
-
-            return model_type
-
-        except Exception as e:
-            if verbose:
-                print(f"  ⚠️  Ошибка определения типа модели: {e}")
-            return 'unknown'
-
-    def debug_model_features(self, model: Any, scaler: Any, verbose: bool = True):
-        """
-        Диагностика фичей модели и скейлера
-        """
-        if verbose:
-            print(f"\n🔍 ДИАГНОСТИКА МОДЕЛИ:")
-
-            # Информация о модели
-            if hasattr(model, 'feature_names'):
-                print(f"  📋 Фичи в модели (model.feature_names): {len(model.feature_names)}")
-                if isinstance(model.feature_names, list):
-                    print(f"  Первые 10: {model.feature_names[:10]}")
-
-            if hasattr(model, 'base_feature_names'):
-                print(f"  📋 Базовые фичи (model.base_feature_names): {len(model.base_feature_names)}")
-                print(f"  {model.base_feature_names}")
-
-            # Информация о скейлере
-            if scaler is not None:
-                print(f"  🔢 Информация о скейлере:")
-                if hasattr(scaler, 'n_features_in_'):
-                    print(f"    Ожидает фичей: {scaler.n_features_in_}")
-
-                # Пытаемся получить фичи скейлера
-                if hasattr(scaler, 'feature_names_in_'):
-                    print(f"    Фичи скейлера: {len(scaler.feature_names_in_)}")
-                    print(f"    Первые 10: {scaler.feature_names_in_[:10]}")
-
-            # Проверяем, совпадает ли количество фичей
-            if hasattr(model, 'feature_names') and scaler is not None and hasattr(scaler, 'n_features_in_'):
-                model_features_count = len(model.feature_names) if isinstance(model.feature_names, list) else 0
-                if model_features_count > 0:
-                    print(f"  ⚖️  Сравнение фичей:")
-                    print(f"    Модель: {model_features_count} фичей")
-                    print(f"    Скейлер: {scaler.n_features_in_} фичей")
-
-                    if model_features_count != scaler.n_features_in_:
-                        print(f"  ❌ НЕСОВПАДЕНИЕ! Модель и скейлер обучены на разном количестве фичей!")

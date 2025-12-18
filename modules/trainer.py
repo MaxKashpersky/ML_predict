@@ -140,8 +140,8 @@ class ModelTrainer:
             return False
 
     def prepare_training_data(self, symbol: str, timeframe: str,
-                            use_advanced_features: bool = True,
-                            verbose: bool = True) -> Tuple[np.ndarray, np.ndarray, List[str]]:
+                              use_advanced_features: bool = True,
+                              verbose: bool = True) -> Tuple[np.ndarray, np.ndarray, List[str]]:
         """
         Подготовка данных для обучения
         Возвращает X, y и список фичей
@@ -186,6 +186,26 @@ class ModelTrainer:
 
             print(f"   ✅ Всего фичей: {len(data_with_indicators.columns)}")
 
+            # КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: Сохраняем список всех фичей для последующего использования
+            all_features = list(data_with_indicators.columns)
+
+            # ИСКЛЮЧАЕМ ВРЕМЕННЫЕ ФИЧИ И ЦЕЛЕВЫЕ ПЕРЕМЕННЫЕ для обучения
+            exclude_patterns = ['TARGET_', 'HOUR', 'DAY_OF_WEEK', 'MONTH', 'WEEK', '_SIN', '_COS']
+
+            feature_columns_for_training = []
+            for feature in all_features:
+                exclude = False
+                for pattern in exclude_patterns:
+                    if pattern in feature:
+                        exclude = True
+                        break
+                if not exclude:
+                    feature_columns_for_training.append(feature)
+
+            print(f"   📋 Фичи для обучения: {len(feature_columns_for_training)}")
+            if verbose and len(feature_columns_for_training) <= 20:
+                print(f"   📋 Список фичей: {feature_columns_for_training}")
+
             # Проверяем какие целевые переменные есть
             target_columns = [col for col in data_with_indicators.columns if col.startswith('TARGET_')]
 
@@ -229,6 +249,7 @@ class ModelTrainer:
                 target_column=target_column,
                 lookback_window=config.model.LOOKBACK_WINDOW,
                 use_advanced_features=use_advanced_features,
+                feature_columns=feature_columns_for_training,  # КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: передаем фичи
                 verbose=verbose
             )
 
@@ -240,6 +261,10 @@ class ModelTrainer:
             print(f"   📐 Размерность X: {X.shape}")
             print(f"   📐 Размерность y: {y.shape}")
             print(f"   🔤 Количество фичей: {len(feature_names)}")
+
+            # КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: Сохраняем фичи в preprocessor для последующего использования
+            self.preprocessor.last_training_features = feature_names.copy()
+            print(f"   💾 Сохранено {len(feature_names)} фичей в preprocessor")
 
             return X, y, feature_names
 
@@ -1089,67 +1114,62 @@ class ModelTrainer:
     def prepare_sequences_with_features(self, df: pd.DataFrame, target_column: str,
                                         lookback_window: int = 60,
                                         use_advanced_features: bool = True,
+                                        feature_columns: List[str] = None,  # Новый параметр
                                         verbose: bool = True) -> Tuple[np.ndarray, np.ndarray, List[str]]:
         """
         Создание последовательностей для обучения с возвратом имен фичей
         """
         try:
-            # Базовые фичи
-            base_features = ['close', 'volume', 'returns']
+            # КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: Если переданы фичи, используем их
+            if feature_columns is not None:
+                feature_columns_to_use = feature_columns
+            else:
+                # Старая логика (для обратной совместимости)
+                base_features = ['close', 'volume', 'returns']
+                tech_indicators = [col for col in df.columns
+                                   if any(indicator in col for indicator in
+                                          ['SMA', 'EMA', 'RSI', 'MACD', 'BB', 'ATR', 'OBV', 'ADX'])]
+                advanced_features = []
+                if use_advanced_features:
+                    advanced_features = [col for col in df.columns
+                                         if col.startswith('FEATURE_') or
+                                         any(x in col for x in
+                                             ['volatility', 'spread', 'skew', 'kurtosis', 'volume_profile'])]
 
-            # Технические индикаторы
-            tech_indicators = [col for col in df.columns
-                               if any(indicator in col for indicator in
-                                      ['SMA', 'EMA', 'RSI', 'MACD', 'BB', 'ATR', 'OBV', 'ADX'])]
+                feature_columns_to_use = base_features + tech_indicators + advanced_features
 
-            # Расширенные фичи если нужно
-            advanced_features = []
-            if use_advanced_features:
-                advanced_features = [col for col in df.columns
-                                     if col.startswith('FEATURE_') or
-                                     any(x in col for x in
-                                         ['volatility', 'spread', 'skew', 'kurtosis', 'volume_profile'])]
-
-            # Объединяем все фичи
-            feature_columns = base_features + tech_indicators + advanced_features
-
-            # Оставляем только существующие колонки
-            feature_columns = [col for col in feature_columns if col in df.columns]
-
-            # ИСКЛЮЧАЕМ ВРЕМЕННЫЕ ФИЧИ ДЛЯ СОВМЕСТИМОСТИ
-            temporal_features = ['HOUR', 'DAY_OF_WEEK', 'MONTH', 'HOUR_OF_DAY', 'DAY', 'WEEK']
-            feature_columns = [col for col in feature_columns
-                               if not any(temp in col for temp in temporal_features)]
+                # ИСКЛЮЧАЕМ ВРЕМЕННЫЕ ФИЧИ ДЛЯ СОВМЕСТИМОСТИ
+                temporal_features = ['HOUR', 'DAY_OF_WEEK', 'MONTH', 'HOUR_OF_DAY', 'DAY', 'WEEK', '_SIN', '_COS']
+                feature_columns_to_use = [col for col in feature_columns_to_use
+                                          if not any(temp in col for temp in temporal_features)]
 
             # Сохраняем список фичей для последующего использования
-            self.last_feature_columns = feature_columns.copy()
+            self.last_feature_columns = feature_columns_to_use.copy()
 
-            # Убираем NaN из фичей
-            df_features = df[feature_columns].copy()
+            # Оставляем только существующие колонки
+            feature_columns_to_use = [col for col in feature_columns_to_use if col in df.columns]
 
-            # Заполняем NaN (forward fill, затем backward fill)
-            df_features = df_features.ffill().bfill()
+            missing_features = [col for col in self.last_feature_columns if col not in df.columns]
+            if missing_features and verbose:
+                print(f"   ⚠️  Отсутствуют фичи: {missing_features[:5]}...")
 
-            # Удаляем строки где все значения NaN
-            df_features = df_features.dropna(how='all')
-
-            if len(feature_columns) == 0:
+            if len(feature_columns_to_use) == 0:
                 print("   ❌ Нет фичей для обучения")
                 return np.array([]), np.array([]), []
 
-            print(f"   🔍 Используется {len(feature_columns)} фичей")
+            print(f"   🔍 Используется {len(feature_columns_to_use)} фичей")
             if verbose:
-                print(f"   📋 Фичи: {', '.join(feature_columns[:10])}" +
-                      ("..." if len(feature_columns) > 10 else ""))
+                print(f"   📋 Фичи: {', '.join(feature_columns_to_use[:10])}" +
+                      ("..." if len(feature_columns_to_use) > 10 else ""))
 
             # Создаем массивы
             X = []
             y = []
 
-            data_features = df_features.values
+            data_features = df[feature_columns_to_use].values
             data_target = df[target_column].values
 
-            for i in range(lookback_window, len(df_features)):
+            for i in range(lookback_window, len(df)):
                 X.append(data_features[i - lookback_window:i])
                 y.append(data_target[i])
 
@@ -1163,8 +1183,10 @@ class ModelTrainer:
             print(f"   📐 Размерность X: {X_array.shape}")
             print(f"   📐 Размерность y: {y_array.shape}")
 
-            return X_array, y_array, feature_columns
+            return X_array, y_array, feature_columns_to_use
 
         except Exception as e:
             print(f"   ❌ Ошибка создания последовательностей: {e}")
+            import traceback
+            traceback.print_exc()
             return np.array([]), np.array([]), []

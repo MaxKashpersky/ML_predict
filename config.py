@@ -32,8 +32,8 @@ class TradingConfig:
     # Риск-менеджмент (значения по умолчанию)
     _stop_loss_pct: float = 2.0
     _take_profit_pct: float = 4.0
-    _position_size_pct: float = 1.0
-    _max_positions: int = 3
+    _position_size_pct: float = 10.0
+    _max_positions: int = 9
     _commission: float = 0.001
     _leverage: int = 3
 

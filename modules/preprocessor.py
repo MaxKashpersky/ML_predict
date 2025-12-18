@@ -430,22 +430,30 @@ class DataPreprocessor:
     def prepare_features_for_prediction(self, df: pd.DataFrame,
                                         lookback_window: int = 60,
                                         verbose: bool = True) -> np.ndarray:
-        """
-        Подготовка фичи для предсказания
-
-        Args:
-            df: DataFrame с индикаторами
-            lookback_window: Окно для создания последовательностей
-            verbose: Флаг логирования
-
-        Returns:
-            X для предсказания
-        """
+        """Подготовка фичи для предсказания"""
         try:
-            # Отделяем фичи
-            feature_columns = [col for col in df.columns
-                               if not col.startswith('TARGET_')
-                               and col not in ['open', 'high', 'low', 'close', 'volume']]
+            # КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: используем ТОЧНО ТАКИЕ ЖЕ фичи, как при обучении
+            if hasattr(self, 'last_training_features'):
+                # Используем сохраненные фичи из обучения
+                feature_columns = self.last_training_features
+            else:
+                # Отделяем фичи (старая логика)
+                feature_columns = [col for col in df.columns
+                                   if not col.startswith('TARGET_')
+                                   and col not in ['open', 'high', 'low', 'close', 'volume']]
+
+            # Оставляем только существующие колонки
+            available_features = [col for col in feature_columns if col in df.columns]
+            missing_features = [col for col in feature_columns if col not in df.columns]
+
+            if missing_features:
+                if verbose:
+                    self.log(f"⚠️  Missing {len(missing_features)} features: {missing_features[:10]}", 'warning')
+                    self.log(f"   Available: {len(available_features)} features", 'info')
+
+                # Создаем недостающие фичи с нулевыми значениями
+                for feature in missing_features:
+                    df[feature] = 0
 
             X_data = df[feature_columns].values
 
@@ -455,11 +463,12 @@ class DataPreprocessor:
 
                 if verbose:
                     self.log(f"Created sequence for prediction: {X_sequence.shape}")
+                    self.log(f"Features used: {len(feature_columns)}")
+                    self.log(f"Expected features for XGBoost: 3300 (55 × 60)")
 
                 return X_sequence
             else:
-                self.log(f"Insufficient data for sequence creation. "
-                         f"Required: {lookback_window}, available: {len(X_data)}", 'warning')
+                self.log(f"Insufficient data for sequence creation", 'warning')
                 return np.array([])
 
         except Exception as e:
