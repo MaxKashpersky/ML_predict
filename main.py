@@ -16,6 +16,10 @@ from modules.backtester import Backtester
 from modules.state_manager import state_manager
 from config import config
 
+
+import sys
+import time
+
 # Настройка кодировки UTF-8 для Windows
 if sys.platform == "win32":
     import io
@@ -36,6 +40,56 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+
+
+class ProgressBar:
+    """Класс для отображения прогресс-бара"""
+
+    def __init__(self, total, prefix='', suffix='', length=50, fill='█'):
+        self.total = total
+        self.prefix = prefix
+        self.suffix = suffix
+        self.length = length
+        self.fill = fill
+        self.start_time = time.time()
+
+    def update(self, iteration):
+        """Обновить прогресс-бар"""
+        percent = ("{0:.1f}").format(100 * (iteration / float(self.total)))
+        filled_length = int(self.length * iteration // self.total)
+        bar = self.fill * filled_length + '-' * (self.length - filled_length)
+
+        elapsed_time = time.time() - self.start_time
+        if iteration > 0:
+            time_per_item = elapsed_time / iteration
+            remaining = self.total - iteration
+            eta = time_per_item * remaining
+            eta_str = f"ETA: {self.format_time(eta)}"
+        else:
+            eta_str = "ETA: --:--:--"
+
+        sys.stdout.write(f'\r{self.prefix} |{bar}| {percent}% {self.suffix} {eta_str}')
+        sys.stdout.flush()
+
+    def finish(self):
+        """Завершить прогресс-бар"""
+        sys.stdout.write('\n')
+        sys.stdout.flush()
+
+    @staticmethod
+    def format_time(seconds):
+        """Форматирование времени"""
+        if seconds < 60:
+            return f"{seconds:.0f}с"
+        elif seconds < 3600:
+            minutes = seconds // 60
+            seconds = seconds % 60
+            return f"{minutes:.0f}м {seconds:.0f}с"
+        else:
+            hours = seconds // 3600
+            minutes = (seconds % 3600) // 60
+            return f"{hours:.0f}ч {minutes:.0f}м"
+
 
 
 class TradingBot:
@@ -217,8 +271,9 @@ class TradingBot:
         except Exception as e:
             print(f"❌ Ошибка настройки периодов: {e}")
 
+    # main.py - обновленный метод update_data()
     def update_data(self):
-        """Обновление исторических данных для выбранной криптовалюты"""
+        """Обновление исторических данных для выбранной криптовалюты с прогресс-баром"""
         try:
             if not self.selected_symbol:
                 print("❌ Сначала выберите криптовалюту!")
@@ -234,7 +289,7 @@ class TradingBot:
             print(f"   Криптовалюта: {self.selected_symbol}")
             print(f"   Таймфрейм:    {state_manager.get_selected_timeframe()}")
             print(f"   Период:       {start_date.date()} - {end_date.date()}")
-            print(f"   Дней:         {days_back}")
+            print(f"   Дней:         {days_back:,}")
             print("=" * 50)
 
             # Получаем таймфрейм для обучения
@@ -243,11 +298,52 @@ class TradingBot:
             # Проверка доступности данных
             print("🔍 Проверка доступности данных на Binance...")
 
-            # Получение данных
+            # Проверяем соединение
+            try:
+                test_price = self.data_fetcher.exchange.fetch_ticker(f"{self.selected_symbol.replace('USDT', '/USDT')}")
+                print(f"✅ Подключение к Binance: OK")
+                print(f"   Текущая цена: ${test_price['last']:.2f}")
+            except Exception as e:
+                print(f"⚠️  Проблемы с подключением к Binance: {e}")
+
+            # Проверяем наличие данных в базе
+            existing_data = self.db.get_historical_data(
+                symbol=self.selected_symbol,
+                timeframe=timeframe,
+                start_date=start_date,
+                end_date=end_date,
+                verbose=False
+            )
+
+            if not existing_data.empty:
+                print(f"\n📊 В базе уже есть {len(existing_data):,} свечей")
+                print(f"   Первая свеча в базе: {existing_data.index[0]}")
+                print(f"   Последняя свеча в базе: {existing_data.index[-1]}")
+
+                # Показываем пропуски
+                total_minutes = (end_date - start_date).total_seconds() / 60
+                timeframe_minutes = self.get_timeframe_minutes(timeframe)  # Добавьте этот метод в TradingBot
+                expected_candles = total_minutes / timeframe_minutes
+                completeness = len(existing_data) / expected_candles * 100
+
+                print(f"   Полнота данных: {completeness:.1f}%")
+
+                if completeness > 95:
+                    print(f"\n✅ Данные достаточно полные. Продолжить загрузку?")
+                    choice = input("   Загрузить недостающие данные? (y/n): ")
+                    if choice.lower() != 'y':
+                        print("❌ Загрузка отменена")
+                        return
+
+            print(f"\n🚀 Начинаю загрузку...")
+            print("-" * 50)
+
+            # Получение данных с прогресс-баром
             data = self.data_fetcher.fetch_historical_data(
                 symbol=self.selected_symbol,
                 timeframe=timeframe,
-                days_back=days_back
+                days_back=days_back,
+                show_progress=True
             )
 
             if data.empty:
@@ -260,38 +356,87 @@ class TradingBot:
                 print("   2. Попробуйте другой таймфрейм")
                 print("   3. Уменьшите период загрузки")
                 print("   4. Проверьте подключение к интернету")
+                print("   5. Попробуйте перезапустить программу")
                 return
 
             # Анализ полученных данных
-            print(f"\n✅ Данные получены: {len(data)} свечей")
-            print(f"   Первая свеча: {data.index[0]}")
-            print(f"   Последняя свеча: {data.index[-1]}")
-            print(f"   Пропущенных значений: {data.isnull().sum().sum()}")
+            print(f"\n{'=' * 50}")
+            print(f"✅ ДАННЫЕ ПОЛУЧЕНЫ: {len(data):,} свечей")
+            print(f"📅 Первая свеча: {data.index[0]}")
+            print(f"📆 Последняя свеча: {data.index[-1]}")
+
+            # Статистика
+            missing_values = data.isnull().sum().sum()
+            zero_volume = (data['volume'] == 0).sum()
+
+            print(f"📊 СТАТИСТИКА:")
+            print(f"   Пропущенных значений: {missing_values:,}")
+            print(f"   Свечей с нулевым объемом: {zero_volume:,}")
+            print(f"   Средний объем: {data['volume'].mean():,.2f}")
+            print(f"   Средняя цена: ${data['close'].mean():,.2f}")
+            print(f"   Волатильность (ATR): {data['high'].std():.2f}")
+
+            if missing_values > 0:
+                print(f"⚠️  ВНИМАНИЕ: Есть пропущенные значения!")
+                print("   Рекомендуется проверить качество данных")
 
             # Сохранение в БД
             print(f"\n💾 СОХРАНЕНИЕ ДАННЫХ В БАЗУ...")
-            success = self.db.store_historical_data(
+
+            # Создаем прогресс-бар для сохранения
+            print("🔄 Сохранение: [", end="", flush=True)
+            batch_size = 1000
+            for i in range(0, len(data), batch_size):
+                batch = data.iloc[i:i + batch_size]
+                success = self.db.store_historical_data(
+                    symbol=self.selected_symbol,
+                    timeframe=timeframe,
+                    data=batch,
+                    verbose=False  # Отключаем вывод в методе сохранения
+                )
+                if not success:
+                    print(f"\n❌ Ошибка при сохранении батча {i}-{i + batch_size}")
+
+                # Прогресс каждые 10%
+                progress = int((i + batch_size) / len(data) * 50)
+                if progress % 5 == 0:
+                    print("=", end="", flush=True)
+
+            print("] 100%")
+
+            # Проверяем результат
+            saved_data = self.db.get_historical_data(
                 symbol=self.selected_symbol,
                 timeframe=timeframe,
-                data=data,
-                verbose=True
+                start_date=start_date,
+                end_date=end_date,
+                verbose=False
             )
 
-            if success:
-                logger.info(f"Saved {len(data)} rows for {self.selected_symbol} {timeframe}")
-                print(f"✅ Данные сохранены: {len(data)} свечей")
+            print(f"\n📊 РЕЗУЛЬТАТ СОХРАНЕНИЯ:")
+            print(f"   Загружено: {len(data):,} свечей")
+            print(f"   Сохранено в базе: {len(saved_data):,} свечей")
 
-                # Дополнительная статистика
-                if len(data) > 0:
-                    print(f"\n📊 СТАТИСТИКА ДАННЫХ:")
-                    print(f"   Средний объем: {data['volume'].mean():.2f}")
-                    print(f"   Волатильность (ATR): {data['high'].std():.2f}")
+            if len(saved_data) >= len(data) * 0.95:  # 95% успешного сохранения
+                print(f"✅ Успешно сохранено: {len(saved_data) / len(data) * 100:.1f}% данных")
+
+                # Показываем охват данных
+                date_range = (saved_data.index[-1] - saved_data.index[0]).days
+                print(f"📅 Охват периода: {date_range} дней")
+
+                if date_range >= days_back * 0.9:
+                    print(f"🎉 Отличный охват данных!")
+                else:
+                    print(f"⚠️  Охват данных меньше ожидаемого")
             else:
-                print("❌ Ошибка сохранения данных в базу")
+                print(f"❌ Сохранено только {len(saved_data) / len(data) * 100:.1f}% данных")
+                print(f"   Возможно, были дубликаты или ошибки записи")
 
         except Exception as e:
             logger.error(f"Error updating data: {e}")
             print(f"❌ Ошибка загрузки данных: {e}")
+            import traceback
+            print(f"Детали: {traceback.format_exc()}")
 
     def train_specific_model(self):
         """Обучение конкретной модели с выбором таймфрейма"""
@@ -642,7 +787,14 @@ class TradingBot:
                 if not models_df.empty:
                     print("\n📋 ДОСТУПНЫЕ МОДЕЛИ:")
                     for i, (_, row) in enumerate(models_df.iterrows()):
-                        print(f"   {i+1}. {row['model_type']} - создана {row['created_at'][:10]}")
+                        created_at = row['created_at']
+                        if hasattr(created_at, 'strftime'):  # Если это datetime/timestamp
+                            date_str = created_at.strftime('%Y-%m-%d')
+                        elif isinstance(created_at, str):  # Если это строка
+                            date_str = created_at[:10] if len(created_at) >= 10 else created_at
+                        else:  # Любой другой тип
+                            date_str = str(created_at)[:10] if len(str(created_at)) >= 10 else str(created_at)
+                        print(f"   {i + 1}. {row['model_type']} - создана {date_str}")
 
                     model_idx = input(f"\nВыберите модель (1-{len(models_df)}): ").strip()
                     if model_idx.isdigit() and 1 <= int(model_idx) <= len(models_df):
@@ -656,11 +808,18 @@ class TradingBot:
             # Получение сигнала
             print(f"\n🔍 ПОЛУЧЕНИЕ АКТУАЛЬНЫХ ДАННЫХ...")
 
-            signal = self.predictor.get_signal(
-                symbol=self.selected_symbol,
-                model_id=model_id,
-                verbose=True
-            )
+            if model_id:
+                signal = self.predictor.get_signal(
+                    symbol=self.selected_symbol,
+                    model_id=model_id,  # Передаем model_id, если он есть
+                    verbose=True
+                )
+            else:
+                # Автоматический выбор лучшей модели
+                signal = self.predictor.get_signal(
+                    symbol=self.selected_symbol,
+                    verbose=True
+                )
 
             signals = {self.selected_symbol: signal}
 
@@ -811,6 +970,21 @@ class TradingBot:
             logger.error(f"Error in pipeline: {e}")
             print(f"\n❌ Ошибка в пайплайне: {e}")
             return None
+
+    def get_timeframe_minutes(self, timeframe: str) -> int:
+        """Конвертация таймфрейма в минуты"""
+        timeframe_map = {
+            '1m': 1,
+            '5m': 5,
+            '15m': 15,
+            '30m': 30,
+            '1h': 60,
+            '4h': 240,
+            '1d': 1440,
+            '1w': 10080,
+            '1M': 43200
+        }
+        return timeframe_map.get(timeframe, 5)  # по умолчанию 5 минут
 
 
 def display_main_menu():
@@ -1337,64 +1511,106 @@ def run_interactive_mode(bot):
 
 def main():
     """Основная функция"""
+    # ===== ДОБАВЬТЕ ЭТО В НАЧАЛЕ ФУНКЦИИ main() =====
+    # Отключить логирование TensorFlow и abseil
+    import os
+    import warnings
+    import sys
+    import io
+    import contextlib
+    import tensorflow as tf
+    from tensorflow import keras
+
+    # Установить уровень логирования
+    os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'  # Отключить все логи TensorFlow
+
+    # Отключить логирование abseil (absl)
+    os.environ['TF_ABS_SUPPRESS_LOGGING'] = '1'
+
+    # Отключить логирование на уровне Python
+    tf.get_logger().setLevel('ERROR')
+    import absl.logging
+    absl.logging.set_verbosity(absl.logging.ERROR)
+
+    # Отключить предупреждения
+    warnings.filterwarnings('ignore')
+
+    # Отключить прогресс-бар Keras для предсказания
+    try:
+        keras.utils.disable_interactive_logging()
+    except:
+        pass
+
+    # Отключить интерактивный режим Keras
+    tf.autograph.set_verbosity(0)
+
+    # Перенаправить stderr для TensorFlow
+    original_stderr = sys.stderr
+    sys.stderr = io.StringIO()
+    # ================================================
+
     print("\n" + "=" * 60)
     print("🤖 AI TRADING BOT v2.0 - АВТОМАТИЗИРОВАННАЯ ТОРГОВЛЯ")
-    print("=" * 60)
-    print("Версия: 2.0")
-    print("Дата сборки: 2024")
-    print("Автор: AI Trading Team")
-    print("=" * 60)
-
     try:
-        bot = TradingBot()
-        print("✅ Бот инициализирован успешно!")
+        print("=" * 60)
+        print("Версия: 2.0")
+        print("Дата сборки: 2024")
+        print("Автор: AI Trading Team")
+        print("=" * 60)
 
-        # Проверка системных требований
-        print("\n🔍 ПРОВЕРКА СИСТЕМНЫХ ТРЕБОВАНИЙ...")
-        import platform
-        print(f"   ОС: {platform.system()} {platform.release()}")
-        print(f"   Python: {platform.python_version()}")
+        try:
+            bot = TradingBot()
+            print("✅ Бот инициализирован успешно!")
 
-        # Проверка аргументов командной строки
-        if len(sys.argv) > 1:
-            mode = sys.argv[1].lower()
-            print(f"\n🚀 Запуск в режиме: {mode}")
+            # Проверка системных требований
+            print("\n🔍 ПРОВЕРКА СИСТЕМНЫХ ТРЕБОВАНИЙ...")
+            import platform
+            print(f"   ОС: {platform.system()} {platform.release()}")
+            print(f"   Python: {platform.python_version()}")
 
-            if mode == "select":
-                bot.select_cryptocurrency()
-            elif mode == "update":
-                bot.update_data()
-            elif mode == "train":
-                bot.train_specific_model()
-            elif mode == "backtest":
-                bot.run_backtest()
-            elif mode == "signal":
-                bot.generate_signals()
-            elif mode == "pipeline":
-                bot.run_pipeline()
-            elif mode == "scheduler":
-                start_scheduler_mode(bot)
+            # Проверка аргументов командной строки
+            if len(sys.argv) > 1:
+                mode = sys.argv[1].lower()
+                print(f"\n🚀 Запуск в режиме: {mode}")
+
+                if mode == "select":
+                    bot.select_cryptocurrency()
+                elif mode == "update":
+                    bot.update_data()
+                elif mode == "train":
+                    bot.train_specific_model()
+                elif mode == "backtest":
+                    bot.run_backtest()
+                elif mode == "signal":
+                    bot.generate_signals()
+                elif mode == "pipeline":
+                    bot.run_pipeline()
+                elif mode == "scheduler":
+                    start_scheduler_mode(bot)
+                else:
+                    print("\n📚 ДОСТУПНЫЕ РЕЖИМЫ:")
+                    print("   select    - Выбор криптовалюты")
+                    print("   update    - Обновление данных")
+                    print("   train     - Обучение модели")
+                    print("   backtest  - Запуск бэктеста")
+                    print("   signal    - Генерация сигналов")
+                    print("   pipeline  - Полный пайплайн")
+                    print("   scheduler - Режим планировщика")
+                    print("\n💡 Или запустите без аргументов для интерактивного меню")
             else:
-                print("\n📚 ДОСТУПНЫЕ РЕЖИМЫ:")
-                print("   select    - Выбор криптовалюты")
-                print("   update    - Обновление данных")
-                print("   train     - Обучение модели")
-                print("   backtest  - Запуск бэктеста")
-                print("   signal    - Генерация сигналов")
-                print("   pipeline  - Полный пайплайн")
-                print("   scheduler - Режим планировщика")
-                print("\n💡 Или запустите без аргументов для интерактивного меню")
-        else:
-            # Запуск интерактивного меню
-            run_interactive_mode(bot)
+                # Запуск интерактивного меню
+                run_interactive_mode(bot)
 
-    except KeyboardInterrupt:
-        print("\n\n👋 Программа прервана пользователем")
-        sys.exit(0)
-    except Exception as e:
-        print(f"\n❌ Ошибка инициализации бота: {e}")
-        logger.exception("Bot initialization error")
-        sys.exit(1)
+        except KeyboardInterrupt:
+            print("\n\n👋 Программа прервана пользователем")
+            sys.exit(0)
+        except Exception as e:
+            print(f"\n❌ Ошибка инициализации бота: {e}")
+            logger.exception("Bot initialization error")
+            sys.exit(1)
+    finally:
+        # Восстановить stderr
+        sys.stderr = original_stderr
 
 
 if __name__ == "__main__":

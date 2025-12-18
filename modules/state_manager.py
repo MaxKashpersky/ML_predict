@@ -91,11 +91,8 @@ class StateManager:
         """
         now = datetime.now()
 
-        # Общая длительность: обучение + бэктест
-        total_days = self.get_training_period() + self.get_backtest_period()
-
-        # Дата окончания обучения = сейчас - период бэктеста
-        train_end = now - timedelta(days=self.get_backtest_period())
+        # Дата окончания обучения = сейчас - период бэктеста - 1 день буфера
+        train_end = now - timedelta(days=self.get_backtest_period() + 1)
 
         # Дата начала обучения
         train_start = train_end - timedelta(days=self.get_training_period())
@@ -114,7 +111,7 @@ class StateManager:
         # Дата окончания бэктеста = сейчас
         backtest_end = now
 
-        # Дата начала бэктеста
+        # Дата начала бэктеста = сейчас - период бэктеста
         backtest_start = now - timedelta(days=self.get_backtest_period())
 
         return backtest_start, backtest_end
@@ -128,7 +125,7 @@ class StateManager:
         """
         now = datetime.now()
 
-        # Загружаем данные за период: обучение + бэктест + небольшой запас
+        # Загружаем данные за период: обучение + бэктест + небольшой запас (30 дней)
         total_days = self.get_training_period() + self.get_backtest_period() + 30
 
         start_date = now - timedelta(days=total_days)

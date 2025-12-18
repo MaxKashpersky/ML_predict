@@ -123,10 +123,10 @@ class ModelConfig:
 class DataConfig:
     """Конфигурация данных"""
     # Периоды (по умолчанию)
-    TRAINING_PERIOD_DAYS = 730  # 2 года для обучения
-    BACKTEST_PERIOD_DAYS = 30  # 30 дней для бэктеста
-    UPDATE_INTERVAL_HOURS = 1  # Обновление данных каждые N часов
-    DEFAULT_UPDATE_DAYS = 120  # По умолчанию загружаем 120 дней
+    TRAINING_PERIOD_DAYS = 180  # 6 месяцев для обучения (вместо 730)
+    BACKTEST_PERIOD_DAYS = 30   # 30 дней для бэктеста
+    UPDATE_INTERVAL_HOURS = 1   # Обновление данных каждые N часов
+    DEFAULT_UPDATE_DAYS = 120   # По умолчанию загружаем 120 дней
 
     # Технические индикаторы
     INDICATORS = [

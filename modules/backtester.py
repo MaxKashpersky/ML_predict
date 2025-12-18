@@ -2,8 +2,15 @@
 Модуль для бэктестирования торговых стратегий
 """
 
-import pandas as pd
+# ===== ДОБАВЬТЕ ЭТОТ БЛОК ПОСЛЕ ИМПОРТОВ =====
+import os
+import warnings
+import sys
+import io
+import contextlib
+import time
 import numpy as np
+import pandas as pd
 import logging
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple, Any
@@ -12,6 +19,27 @@ from modules.database import Database
 from modules.predictor import SignalPredictor
 from modules.preprocessor import DataPreprocessor
 from modules.state_manager import state_manager
+
+# Отключить логирование TensorFlow
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+os.environ['TF_ABS_SUPPRESS_LOGGING'] = '1'
+
+# Отключить предупреждения
+warnings.filterwarnings('ignore')
+
+# Отключить логирование TensorFlow и abseil
+try:
+    import absl.logging
+    absl.logging.set_verbosity(absl.logging.ERROR)
+except:
+    pass
+
+try:
+    import tensorflow as tf
+    tf.get_logger().setLevel('ERROR')
+    tf.autograph.set_verbosity(0)
+except:
+    pass
 
 
 class Backtester:
@@ -30,6 +58,10 @@ class Backtester:
         self.stop_loss_pct = config.trading.STOP_LOSS_PCT / 100
         self.take_profit_pct = config.trading.TAKE_PROFIT_PCT / 100
         self.slippage = getattr(config.backtest, 'SLIPPAGE', 0.0005)
+
+        # Константы для пакетной обработки
+        self.LSTM_BATCH_SIZE = getattr(config.backtest, 'LSTM_BATCH_SIZE', 256)
+        self.PROGRESS_UPDATE_INTERVAL = getattr(config.backtest, 'PROGRESS_UPDATE_INTERVAL', 100)
 
     def setup_logging(self):
         """Настройка логирования"""
@@ -147,374 +179,333 @@ class Backtester:
             self.log(f"Error preparing backtest data: {str(e)}", 'error')
             return pd.DataFrame()
 
-    def generate_backtest_signals(self, data: pd.DataFrame, model: Any, scaler: Any,
-                                  model_type: str, verbose: bool = True) -> pd.DataFrame:
+    class ProgressBar:
+        """Универсальный прогресс-бар для различных операций"""
+
+        def __init__(self, total, prefix='Прогресс', suffix='завершено', length=30, fill='█', verbose=True):
+            self.total = total
+            self.prefix = prefix
+            self.suffix = suffix
+            self.length = length
+            self.fill = fill
+            self.start_time = time.time()
+            self.current = 0
+            self.verbose = verbose
+            self.last_update_time = time.time()
+            self.update_interval = 0.5  # Обновлять не чаще чем раз в 0.5 секунд
+
+        def update(self, iteration=None, force=False):
+            """Обновить прогресс-бар"""
+            if not self.verbose:
+                return
+
+            current_time = time.time()
+            if not force and current_time - self.last_update_time < self.update_interval:
+                return
+
+            self.last_update_time = current_time
+
+            if iteration is not None:
+                self.current = iteration
+            else:
+                self.current += 1
+
+            percent = ("{0:.1f}").format(100 * (self.current / float(self.total)))
+            filled_length = int(self.length * self.current // self.total)
+            bar = self.fill * filled_length + '─' * (self.length - filled_length)
+
+            elapsed_time = time.time() - self.start_time
+            if self.current > 0:
+                time_per_item = elapsed_time / self.current
+                remaining = self.total - self.current
+                eta = time_per_item * remaining
+                eta_str = f"ETA: {self._format_time(eta)}"
+            else:
+                eta_str = "ETA: --:--:--"
+
+            # Очистить строку и вывести прогресс
+            sys.stdout.write(f'\r{self.prefix} │{bar}│ {percent}% {self.suffix} {eta_str}')
+            sys.stdout.flush()
+
+        def finish(self, message=""):
+            """Завершить прогресс-бар"""
+            if not self.verbose:
+                return
+
+            elapsed_time = time.time() - self.start_time
+            elapsed_str = self._format_time(elapsed_time)
+
+            if message:
+                sys.stdout.write(f'\r{message} │ Время: {elapsed_str}\n')
+            else:
+                sys.stdout.write(f'\r{self.prefix} завершено │ Время: {elapsed_str}\n')
+            sys.stdout.flush()
+
+        @staticmethod
+        def _format_time(seconds):
+            """Форматирование времени"""
+            if seconds < 60:
+                return f"{seconds:.1f}с"
+            elif seconds < 3600:
+                minutes = seconds // 60
+                seconds = seconds % 60
+                return f"{minutes:.0f}м {seconds:.0f}с"
+            else:
+                hours = seconds // 3600
+                minutes = (seconds % 3600) // 60
+                return f"{hours:.0f}ч {minutes:.0f}м"
+
+    def generate_lstm_signals_batch(self, data: pd.DataFrame, model: Any, scaler: Any,
+                                    feature_columns: List[str], lookback_window: int,
+                                    verbose: bool = True) -> pd.DataFrame:
         """
-        Генерация торговых сигналов для бэктеста
+        Генерация сигналов LSTM с пакетной обработкой
         """
         try:
             if data.empty or model is None:
                 return pd.DataFrame()
 
-            # Создаем копию данных для сигналов
-            signals_df = data.copy()
-            signals_df['signal'] = 0  # 0 = HOLD, 1 = LONG, -1 = SHORT
-            signals_df['confidence'] = 0.0
-            signals_df['prediction_time'] = signals_df.index
+            total_points = len(data) - lookback_window
+            if total_points <= 0:
+                return pd.DataFrame()
 
-            # Получаем lookback_window из конфига
-            lookback_window = config.model.LOOKBACK_WINDOW
+            if verbose:
+                print(f"  🤖 LSTM: Генерация сигналов для {total_points} точек")
+                print(f"  📊 Используется {len(feature_columns)} фичей")
+                print(f"  📦 Размер пакета: {self.LSTM_BATCH_SIZE}")
 
-            # Получаем feature_names из модели если есть
-            feature_names = None
-            if hasattr(model, 'feature_names'):
-                feature_names = model.feature_names
-            elif hasattr(model, 'base_feature_names'):
-                # Используем базовые имена фичей для XGBoost
-                feature_names = model.base_feature_names
+            # Подготавливаем массив для всех предсказаний
+            all_predictions = np.zeros(total_points)
+            all_confidences = np.zeros(total_points)
 
-            # Если нет feature_names, получаем их из данных
-            if feature_names is None:
-                feature_names = [col for col in data.columns
-                                 if not col.startswith('TARGET_')
-                                 and col not in ['signal', 'confidence', 'prediction_time']
-                                 and pd.api.types.is_numeric_dtype(data[col])]
+            # Подготавливаем пакеты данных
+            num_batches = (total_points + self.LSTM_BATCH_SIZE - 1) // self.LSTM_BATCH_SIZE
 
-            # Для XGBoost нам нужны правильные фичи
-            if 'xgb' in model_type.lower():
-                # Для XGBoost, который обучался на 2D данных (lookback_window * features)
-                expected_features = lookback_window * len(feature_names)
-            else:
-                expected_features = len(feature_names)
+            if verbose:
+                progress = self.ProgressBar(
+                    total=num_batches,
+                    prefix='🤖 LSTM пакетная обработка',
+                    suffix='пакетов обработано',
+                    verbose=verbose
+                )
 
-            for i in range(lookback_window, len(signals_df)):
+            for batch_idx in range(num_batches):
                 try:
-                    # Берем окно данных
-                    window_data = signals_df.iloc[i - lookback_window:i]
+                    start_idx = batch_idx * self.LSTM_BATCH_SIZE
+                    end_idx = min(start_idx + self.LSTM_BATCH_SIZE, total_points)
+                    batch_size = end_idx - start_idx
 
-                    # Проверяем, что у нас достаточно фичей
-                    available_features = [col for col in feature_names if col in window_data.columns]
+                    # Подготавливаем пакет данных
+                    batch_data = np.zeros((batch_size, lookback_window, len(feature_columns)))
 
-                    if len(available_features) != len(feature_names):
-                        if verbose and i == lookback_window:  # Показываем только для первого окна
-                            self.log(f"Feature mismatch: expected {len(feature_names)}, got {len(available_features)}",
-                                     'warning')
-                        continue
+                    for i in range(batch_size):
+                        window_start = start_idx + i
+                        window_end = window_start + lookback_window
 
-                    # Готовим данные для предсказания
-                    X_window = window_data[available_features].values
+                        # Извлекаем окно данных
+                        window_data = data.iloc[window_start:window_end][feature_columns].values
+                        batch_data[i] = window_data
 
-                    # Для XGBoost нужно преобразовать в 2D
-                    if 'xgb' in model_type.lower():
-                        X_window_flat = X_window.flatten().reshape(1, -1)
-
-                        # Проверяем размерность
-                        if X_window_flat.shape[1] != expected_features:
-                            if verbose and i == lookback_window:
-                                self.log(
-                                    f"XGBoost feature shape mismatch: expected {expected_features}, got {X_window_flat.shape[1]}",
-                                    'warning')
-                                self.log(f"Lookback: {lookback_window}, Features: {len(feature_names)}", 'warning')
-                            continue
-
-                        X_window_final = X_window_flat
+                    # Нормализуем пакет если есть скейлер
+                    if scaler is not None:
+                        try:
+                            # Преобразуем в 2D для нормализации
+                            batch_2d = batch_data.reshape(batch_size, -1)
+                            batch_norm_2d = scaler.transform(batch_2d)
+                            batch_norm = batch_norm_2d.reshape(batch_size, lookback_window, -1)
+                        except Exception as e:
+                            if verbose and batch_idx == 0:
+                                print(f"  ⚠️ Ошибка нормализации: {e}")
+                            batch_norm = batch_data
                     else:
-                        # Для LSTM оставляем как есть (3D)
-                        X_window_final = X_window.reshape(1, lookback_window, -1)
+                        batch_norm = batch_data
+
+                    # Предсказание для всего пакета
+                    batch_predictions = model.predict(batch_norm, verbose=0)
+
+                    # Обрабатываем предсказания
+                    for i in range(batch_size):
+                        prediction = batch_predictions[i]
+
+                        if len(prediction.shape) == 0 or prediction.shape[0] == 1:
+                            # Бинарная классификация или регрессия
+                            predicted_class = int(round(prediction[0])) if hasattr(prediction, '__len__') else int(round(prediction))
+                            confidence = abs(prediction[0] - 0.5) * 2 if hasattr(prediction, '__len__') else 0.5
+                            predicted_class = predicted_class - 1  # Преобразуем [0,1,2] -> [-1,0,1]
+                        else:
+                            # Многоклассовая классификация
+                            predicted_class = np.argmax(prediction) - 1
+                            confidence = np.max(prediction)
+
+                        all_predictions[start_idx + i] = predicted_class
+                        all_confidences[start_idx + i] = confidence
+
+                    if verbose:
+                        progress.update(batch_idx + 1)
+
+                except Exception as e:
+                    if verbose:
+                        print(f"  ⚠️ Ошибка в пакете {batch_idx}: {e}")
+                    continue
+
+            if verbose:
+                progress.finish("✅ LSTM пакетная обработка завершена")
+
+            # Создаем DataFrame с результатами
+            result_df = data.iloc[lookback_window:].copy()
+            result_df = result_df.iloc[:len(all_predictions)].copy()
+
+            result_df['signal'] = all_predictions
+            result_df['confidence'] = all_confidences
+            result_df['prediction_time'] = result_df.index
+
+            # Фильтруем только сигналы с предсказаниями
+            signals_df = result_df[result_df['signal'] != 0].copy()
+
+            if verbose:
+                print(f"  ✅ Сгенерировано {len(signals_df)} LSTM сигналов")
+                if len(signals_df) > 0:
+                    long_count = len(signals_df[signals_df['signal'] > 0])
+                    short_count = len(signals_df[signals_df['signal'] < 0])
+                    print(f"  📈 LONG: {long_count}, SHORT: {short_count}")
+
+            return signals_df
+
+        except Exception as e:
+            if verbose:
+                print(f"  ❌ Ошибка пакетной обработки LSTM: {e}")
+                import traceback
+                traceback.print_exc()
+            return pd.DataFrame()
+
+    def generate_xgboost_signals(self, data: pd.DataFrame, model: Any, scaler: Any,
+                                 feature_columns: List[str], lookback_window: int,
+                                 verbose: bool = True) -> pd.DataFrame:
+        """
+        Генерация сигналов XGBoost
+        """
+        try:
+            if data.empty or model is None:
+                return pd.DataFrame()
+
+            total_points = len(data) - lookback_window
+            if total_points <= 0:
+                return pd.DataFrame()
+
+            if verbose:
+                print(f"  🌳 XGBoost: Генерация сигналов для {total_points} точек")
+                progress = self.ProgressBar(
+                    total=total_points,
+                    prefix='🌳 XGBoost предсказания',
+                    suffix='точек обработано',
+                    verbose=verbose
+                )
+
+            # Подготавливаем массивы для результатов
+            signals = np.zeros(len(data))
+            confidences = np.zeros(len(data))
+
+            for i in range(lookback_window, len(data)):
+                try:
+                    # Извлекаем окно данных
+                    window_data = data.iloc[i-lookback_window:i][feature_columns].values
+
+                    # Преобразуем в формат для XGBoost
+                    X_window_flat = window_data.flatten().reshape(1, -1)
 
                     # Нормализуем если есть скейлер
                     if scaler is not None:
                         try:
-                            if 'xgb' in model_type.lower():
-                                X_window_norm = scaler.transform(X_window_final)
-                            else:
-                                X_window_norm = scaler.transform(X_window_final.reshape(1, -1)).reshape(1,
-                                                                                                        lookback_window,
-                                                                                                        -1)
+                            X_norm = scaler.transform(X_window_flat)
                         except Exception as e:
-                            if verbose and i == lookback_window:
-                                self.log(f"Normalization error: {str(e)}", 'warning')
-                            X_window_norm = X_window_final
+                            X_norm = X_window_flat
                     else:
-                        X_window_norm = X_window_final
+                        X_norm = X_window_flat
 
-                    # Делаем предсказание
-                    if hasattr(model, 'predict'):
-                        prediction = model.predict(X_window_norm)
+                    # Предсказание
+                    prediction = model.predict(X_norm)
+                    predicted_class = int(prediction[0]) - 1  # Преобразуем [0,1,2] -> [-1,0,1]
 
-                        if 'lstm' in model_type.lower():
-                            # LSTM возвращает вероятности для каждого класса
-                            if len(prediction.shape) == 2:
-                                predicted_class = np.argmax(prediction[0]) - 1  # Преобразуем [0,1,2] -> [-1,0,1]
-                                confidence = np.max(prediction[0])
-                            else:
-                                predicted_class = int(prediction[0]) - 1
-                                confidence = 0.5
-                        else:
-                            # XGBoost возвращает классы
-                            predicted_class = int(prediction[0]) - 1
-                            confidence = 0.5
+                    # Получаем вероятность если возможно
+                    if hasattr(model, 'predict_proba'):
+                        proba = model.predict_proba(X_norm)
+                        confidence = np.max(proba[0])
+                    else:
+                        confidence = 0.5
 
-                        signals_df.iloc[i, signals_df.columns.get_loc('signal')] = predicted_class
-                        signals_df.iloc[i, signals_df.columns.get_loc('confidence')] = confidence
+                    signals[i] = predicted_class
+                    confidences[i] = confidence
+
+                    if verbose and i % self.PROGRESS_UPDATE_INTERVAL == 0:
+                        progress.update(i)
 
                 except Exception as e:
-                    if verbose and i == lookback_window:  # Показываем только для первого окна
-                        self.log(f"Error generating signal at index {i}: {str(e)}", 'warning')
+                    if verbose and i == lookback_window:
+                        print(f"  ⚠️ Ошибка предсказания: {e}")
                     continue
 
-            # Фильтруем только строки с сигналами
-            signals_with_data = signals_df[signals_df['signal'] != 0].copy()
+            if verbose:
+                progress.finish("✅ XGBoost предсказания завершены")
+
+            # Создаем DataFrame с результатами
+            signals_df = data.copy()
+            signals_df['signal'] = signals
+            signals_df['confidence'] = confidences
+            signals_df['prediction_time'] = signals_df.index
+
+            # Фильтруем только сигналы с предсказаниями
+            valid_signals = signals_df[signals_df['signal'] != 0].copy()
 
             if verbose:
-                self.log(f"Generated {len(signals_with_data)} signals")
+                print(f"  ✅ Сгенерировано {len(valid_signals)} XGBoost сигналов")
+                if len(valid_signals) > 0:
+                    long_count = len(valid_signals[valid_signals['signal'] > 0])
+                    short_count = len(valid_signals[valid_signals['signal'] < 0])
+                    print(f"  📈 LONG: {long_count}, SHORT: {short_count}")
 
-            return signals_with_data
+            return valid_signals
 
         except Exception as e:
-            self.log(f"Error generating backtest signals: {str(e)}", 'error')
+            if verbose:
+                print(f"  ❌ Ошибка генерации XGBoost сигналов: {e}")
             return pd.DataFrame()
 
-    def generate_backtest_signals_simple(self, data: pd.DataFrame, model: Any, scaler: Any,
-                                         model_type: str, verbose: bool = True) -> pd.DataFrame:
+    def generate_backtest_signals_optimized(self, data: pd.DataFrame, model: Any, scaler: Any,
+                                            model_type: str, verbose: bool = True) -> pd.DataFrame:
         """
-        Упрощенная генерация торговых сигналов для бэктеста
+        Оптимизированная генерация торговых сигналов
         """
         try:
             if data.empty or model is None:
                 return pd.DataFrame()
 
-            # Создаем копию данных для сигналов
-            signals_df = data.copy()
-            signals_df['signal'] = 0
-            signals_df['confidence'] = 0.0
+            if verbose:
+                print(f"\n🎯 ГЕНЕРАЦИЯ СИГНАЛОВ ({model_type.upper()})")
+                print(f"  📊 Данные: {len(data)} строк")
+
+            # Определяем фичи для модели
+            feature_columns = self.get_model_features(model, data, verbose)
+            if not feature_columns:
+                if verbose:
+                    print("  ❌ Не удалось определить фичи для модели")
+                return pd.DataFrame()
 
             # Получаем lookback_window из конфига
             lookback_window = config.model.LOOKBACK_WINDOW
 
-            # ВАЖНО: Определяем, какие фичи использовались при обучении
-            # Способ 1: Получаем базовые фичи из модели
-            base_feature_columns = None
-
-            if hasattr(model, 'base_feature_names'):
-                base_feature_columns = model.base_feature_names
-                if verbose:
-                    print(f"  📋 Базовые фичи из модели: {len(base_feature_columns)} фичей")
-                    print(f"  📋 Базовые фичи: {base_feature_columns}")
-            elif hasattr(model, 'feature_names'):
-                # Проверяем, являются ли фичи расширенными
-                feature_names = model.feature_names
-                if isinstance(feature_names, list) and len(feature_names) > 0:
-                    # Если фичи содержат временные лаги - это расширенные фичи
-                    if any('_t-' in str(feature) for feature in feature_names[:10]):
-                        # Извлекаем базовые фичи из расширенных
-                        base_features = set()
-                        for feature in feature_names:
-                            if isinstance(feature, str) and '_t-' in feature:
-                                base_feature = feature.split('_t-')[0]
-                                base_features.add(base_feature)
-                            else:
-                                base_features.add(str(feature))
-                        base_feature_columns = list(base_features)
-                        if verbose:
-                            print(f"  🔍 Обнаружены расширенные фичи в модели")
-                            print(f"  🔄 Извлечено базовых фичей: {len(base_feature_columns)}")
-                    else:
-                        # Если нет временных лагов - это базовые фичи
-                        base_feature_columns = feature_names
-                        if verbose:
-                            print(f"  📋 Используются фичи из модели как базовые: {len(base_feature_columns)} фичей")
-
-            # Способ 2: Если фичи не найдены, используем дефолтный набор
-            if base_feature_columns is None:
-                # Базовый набор фичей (как в trainer.py)
-                base_features = ['close', 'volume', 'returns']
-
-                # Технические индикаторы
-                tech_indicators = [col for col in data.columns
-                                   if any(indicator in col.lower() for indicator in
-                                          ['sma', 'ema', 'rsi', 'macd', 'bb', 'atr', 'obv', 'adx'])]
-
-                base_feature_columns = base_features + tech_indicators
-
-                # Фильтруем только существующие в данных
-                base_feature_columns = [col for col in base_feature_columns if col in data.columns]
-
-                if verbose:
-                    print(
-                        f"  ⚠️  Фичи не найдены в модели, используется дефолтный набор: {len(base_feature_columns)} фичей")
-
-            # Убеждаемся, что все базовые фичи есть в данных
-            missing_features = []
-            for feature in base_feature_columns:
-                if feature not in signals_df.columns:
-                    missing_features.append(feature)
-
-            if missing_features:
-                if verbose:
-                    print(f"  ⚠️  Создаем недостающие базовые фичи: {len(missing_features)} фичей")
-                for feature in missing_features:
-                    signals_df[feature] = 0.0
-
-            # Обновляем список базовых фичей только теми, что есть в данных
-            base_feature_columns = [col for col in base_feature_columns if col in signals_df.columns]
-            base_feature_columns = sorted(base_feature_columns)  # Сортируем для consistency
-
             if verbose:
-                print(f"  🔍 Базовые фичи для XGBoost: {len(base_feature_columns)} фичей")
-                print(f"  📊 Базовые фичи: {base_feature_columns}")
+                print(f"  🔍 Используется {len(feature_columns)} фичей")
                 print(f"  📐 Lookback window: {lookback_window}")
-                print(f"  🤖 Тип модели: {model_type}")
 
-                # Вычисляем ожидаемое количество фичей
-                expected_features = len(base_feature_columns) * lookback_window
-                print(f"  🔢 Ожидается XGBoost фичей: {expected_features} (базовые × lookback)")
-
-                # Проверяем скейлер
-                if scaler is not None and hasattr(scaler, 'n_features_in_'):
-                    print(f"  🔢 Скейлер ожидает: {scaler.n_features_in_} фичей")
-                    if scaler.n_features_in_ != expected_features:
-                        print(
-                            f"  ⚠️  НЕСОВПАДЕНИЕ! Скейлер ожидает {scaler.n_features_in_}, а должно быть {expected_features}")
-
-            # Проверяем, достаточно ли фичей
-            if len(base_feature_columns) == 0:
-                print(f"  ❌ Нет базовых фичей для предсказания")
-                return pd.DataFrame()
-
-            # Генерируем сигналы
-            signals_generated = 0
-
-            for i in range(lookback_window, len(signals_df)):
-                try:
-                    # Берем окно данных
-                    window_data = signals_df.iloc[i - lookback_window:i]
-
-                    # Проверяем, что у нас все нужные базовые фичи
-                    available_features = [col for col in base_feature_columns if col in window_data.columns]
-                    if len(available_features) != len(base_feature_columns):
-                        if verbose and i == lookback_window:
-                            print(
-                                f"  ⚠️  Не все базовые фичи доступны: {len(available_features)} из {len(base_feature_columns)}")
-                        continue
-
-                    # Готовим X для предсказания - КРИТИЧЕСКАЯ ЧАСТЬ!
-                    X_window = window_data[base_feature_columns].values
-
-                    # Для XGBoost преобразуем в 2D с правильным форматом
-                    if 'xgb' in model_type.lower():
-                        # Правильное преобразование: (lookback_window, базовые_фичи) -> (1, lookback_window × базовые_фичи)
-                        X_window_flat = X_window.flatten().reshape(1, -1)
-
-                        # Проверяем размерность
-                        expected_shape = len(base_feature_columns) * lookback_window
-                        actual_shape = X_window_flat.shape[1]
-
-                        if verbose and i == lookback_window:
-                            print(f"  📊 Окно данных shape: {X_window.shape}")
-                            print(f"  📊 После flatten: {X_window_flat.shape}")
-                            print(f"  🔍 Ожидается: {expected_shape}, получено: {actual_shape}")
-
-                        if actual_shape != expected_shape:
-                            if verbose and i == lookback_window:
-                                print(f"  ❌ Размерность не совпадает: {actual_shape} != {expected_shape}")
-                                print(f"     Базовые фичи: {len(base_feature_columns)}, lookback: {lookback_window}")
-                            continue
-
-                        # Нормализуем если есть скейлер
-                        if scaler is not None:
-                            try:
-                                # ВАЖНО: Проверяем, что скейлер ожидает правильное количество фичей
-                                if hasattr(scaler, 'n_features_in_') and scaler.n_features_in_ != actual_shape:
-                                    if verbose and i == lookback_window:
-                                        print(
-                                            f"  ⚠️  Скейлер ожидает {scaler.n_features_in_} фичей, а получили {actual_shape}")
-                                        print(f"  ⚠️  Пытаемся использовать скейлер, но могут быть ошибки...")
-
-                                X_window_norm = scaler.transform(X_window_flat)
-                                if verbose and i == lookback_window:
-                                    print(f"  ✅ Данные нормализованы успешно")
-                            except Exception as scaler_error:
-                                if verbose and i == lookback_window:
-                                    print(f"  ⚠️  Ошибка нормализации: {scaler_error}")
-                                # Продолжаем без нормализации
-                                X_window_norm = X_window_flat
-                        else:
-                            X_window_norm = X_window_flat
-
-                        # Делаем предсказание
-                        try:
-                            prediction = model.predict(X_window_norm)
-                            predicted_class = int(prediction[0]) - 1  # Преобразуем [0,1,2] -> [-1,0,1]
-
-                            # Получаем вероятность если возможно
-                            if hasattr(model, 'predict_proba'):
-                                proba = model.predict_proba(X_window_norm)
-                                confidence = np.max(proba[0])
-                            else:
-                                confidence = 0.5
-
-                            if verbose and i == lookback_window:
-                                print(f"  ✅ Предсказание успешно: class={predicted_class}, confidence={confidence:.3f}")
-                                signals_generated += 1
-                        except Exception as predict_error:
-                            if verbose and i == lookback_window:
-                                print(f"  ⚠️  Ошибка предсказания: {predict_error}")
-                            continue
-
-                    else:  # Для LSTM
-                        X_window_3d = X_window.reshape(1, lookback_window, -1)
-
-                        if verbose and i == lookback_window:
-                            print(f"  📊 LSTM input shape: {X_window_3d.shape}")
-
-                        # Нормализуем если есть скейлер
-                        if scaler is not None:
-                            try:
-                                # Для LSTM скейлер ожидает 2D данные
-                                X_flat = X_window_3d.reshape(1, -1)
-                                X_norm_flat = scaler.transform(X_flat)
-                                X_window_norm = X_norm_flat.reshape(1, lookback_window, -1)
-                            except Exception as e:
-                                if verbose and i == lookback_window:
-                                    print(f"  ⚠️  Ошибка нормализации LSTM: {e}")
-                                X_window_norm = X_window_3d
-                        else:
-                            X_window_norm = X_window_3d
-
-                        # Делаем предсказание
-                        prediction = model.predict(X_window_norm)
-
-                        if len(prediction.shape) == 2:
-                            predicted_class = np.argmax(prediction[0]) - 1
-                            confidence = np.max(prediction[0])
-                        else:
-                            predicted_class = int(prediction[0]) - 1
-                            confidence = 0.5
-
-                    # Сохраняем сигнал
-                    signals_df.iloc[i, signals_df.columns.get_loc('signal')] = predicted_class
-                    signals_df.iloc[i, signals_df.columns.get_loc('confidence')] = confidence
-
-                except Exception as e:
-                    if verbose and i == lookback_window:
-                        print(f"  ⚠️  Ошибка предсказания в точке {i}: {e}")
-                        import traceback
-                        traceback.print_exc()
-                    continue
-
-            # Фильтруем сигналы
-            valid_signals = signals_df[signals_df['signal'] != 0].copy()
-
-            if verbose:
-                print(f"  ✅ Сгенерировано {len(valid_signals)} сигналов")
-                if len(valid_signals) > 0:
-                    long_count = len(valid_signals[valid_signals['signal'] == 1])
-                    short_count = len(valid_signals[valid_signals['signal'] == -1])
-                    hold_count = len(valid_signals[valid_signals['signal'] == 0])
-                    print(f"  📈 Сигналы: LONG={long_count}, SHORT={short_count}, HOLD={hold_count}")
-
-            return valid_signals
+            # Выбираем метод генерации в зависимости от типа модели
+            if 'lstm' in model_type.lower():
+                return self.generate_lstm_signals_batch(
+                    data, model, scaler, feature_columns, lookback_window, verbose
+                )
+            else:  # XGBoost и другие
+                return self.generate_xgboost_signals(
+                    data, model, scaler, feature_columns, lookback_window, verbose
+                )
 
         except Exception as e:
             if verbose:
@@ -523,6 +514,56 @@ class Backtester:
                 traceback.print_exc()
             return pd.DataFrame()
 
+    def get_model_features(self, model: Any, data: pd.DataFrame, verbose: bool = True) -> List[str]:
+        """
+        Получение фичей из модели
+        """
+        try:
+            # Пытаемся получить фичи из атрибутов модели
+            if hasattr(model, 'base_feature_names'):
+                feature_columns = model.base_feature_names
+            elif hasattr(model, '_features'):
+                feature_columns = model._features
+            elif hasattr(model, 'feature_names'):
+                feature_columns = model.feature_names
+
+                # Если это расширенные фичи с лагами, извлекаем базовые
+                if feature_columns and any('_t-' in str(f) for f in feature_columns[:10]):
+                    base_features = set()
+                    for feature in feature_columns:
+                        if isinstance(feature, str) and '_t-' in feature:
+                            base_feature = feature.split('_t-')[0]
+                            base_features.add(base_feature)
+                        else:
+                            base_features.add(str(feature))
+                    feature_columns = list(base_features)
+            else:
+                # Дефолтный набор фичей
+                base_features = ['close', 'volume', 'returns']
+                tech_indicators = [col for col in data.columns
+                                  if any(indicator in col.lower() for indicator in
+                                        ['sma', 'ema', 'rsi', 'macd', 'bb', 'atr', 'obv', 'adx'])]
+                feature_columns = base_features + tech_indicators
+
+            # Фильтруем только существующие в данных
+            feature_columns = [col for col in feature_columns if col in data.columns]
+
+            # Сортируем для consistency
+            feature_columns = sorted(feature_columns)
+
+            if verbose:
+                print(f"  📋 Найдено {len(feature_columns)} фичей")
+                if len(feature_columns) <= 10:
+                    print(f"  📋 Фичи: {feature_columns}")
+                else:
+                    print(f"  📋 Первые 10 фичей: {feature_columns[:10]}...")
+
+            return feature_columns
+
+        except Exception as e:
+            if verbose:
+                print(f"  ⚠️ Ошибка получения фичей из модели: {e}")
+            return []
 
     def execute_backtest(self, signals: pd.DataFrame, initial_balance: float,
                         commission: float, verbose: bool = True) -> Dict[str, Any]:
@@ -541,10 +582,21 @@ class Backtester:
             peak_balance = initial_balance
             max_drawdown = 0.0
 
+            if verbose:
+                print(f"\n💼 ВЫПОЛНЕНИЕ БЭКТЕСТА")
+                print(f"  💰 Начальный баланс: ${initial_balance:,.2f}")
+                print(f"  📊 Всего сигналов: {len(signals)}")
+                progress = self.ProgressBar(
+                    total=len(signals),
+                    prefix='💼 Выполнение сделок',
+                    suffix='сделок обработано',
+                    verbose=verbose
+                )
+
             for i, (timestamp, row) in enumerate(signals.iterrows()):
                 try:
                     current_price = row['close']
-                    signal = row['signal']
+                    signal = int(row['signal'])
                     confidence = row['confidence']
 
                     # Логика торговли
@@ -562,11 +614,12 @@ class Backtester:
                             'pnl': None,
                             'pnl_pct': None,
                             'duration': None,
-                            'result': 'OPEN'
+                            'result': 'OPEN',
+                            'confidence': confidence
                         }
                         trade_history.append(trade)
 
-                        if verbose and len(trade_history) <= 10:  # Показываем только первые 10 сделок
+                        if verbose and len(trade_history) <= 5:
                             print(f"  📈 Открыта {trade['type']} позиция по ${entry_price:.4f}")
 
                     elif position != 0:  # Есть открытая позиция
@@ -617,7 +670,7 @@ class Backtester:
                             position = 0
                             entry_price = 0.0
 
-                            if verbose and len(trade_history) <= 10:
+                            if verbose and len(trade_history) <= 5:
                                 result_emoji = "✅" if pnl > 0 else "❌"
                                 print(f"  {result_emoji} Закрыта позиция: P&L ${pnl:+.2f} ({pnl_pct*100:+.2f}%) - {close_reason}")
 
@@ -628,6 +681,9 @@ class Backtester:
                     current_drawdown = (peak_balance - balance) / peak_balance * 100
                     if current_drawdown > max_drawdown:
                         max_drawdown = current_drawdown
+
+                    if verbose and i % self.PROGRESS_UPDATE_INTERVAL == 0:
+                        progress.update(i)
 
                 except Exception as e:
                     if verbose:
@@ -661,6 +717,9 @@ class Backtester:
                 if verbose:
                     result_emoji = "✅" if pnl > 0 else "❌"
                     print(f"  {result_emoji} Позиция закрыта в конце периода: P&L ${pnl:+.2f} ({pnl_pct*100:+.2f}%)")
+
+            if verbose:
+                progress.finish("✅ Бэктест выполнен")
 
             # Расчет итоговых метрик
             total_trades = len([t for t in trade_history if t['result'] in ['WIN', 'LOSS']])
@@ -713,7 +772,13 @@ class Backtester:
             }
 
             if verbose:
-                self.log(f"Backtest completed: {total_trades} trades, Return: {total_return:.2f}%")
+                print(f"\n📊 РЕЗУЛЬТАТЫ БЭКТЕСТА:")
+                print(f"  💰 Конечный баланс: ${balance:,.2f}")
+                print(f"  📈 Общая доходность: {total_return:.2f}%")
+                print(f"  🎯 Win Rate: {win_rate:.1f}% ({winning_trades}/{total_trades})")
+                print(f"  📊 Макс. просадка: {max_drawdown:.2f}%")
+                print(f"  ⚖️  Profit Factor: {profit_factor:.2f}")
+                print(f"  📊 Всего сделок: {total_trades}")
 
             return results
 
@@ -750,7 +815,7 @@ class Backtester:
                 'initial_balance': results['initial_balance'],
                 'final_balance': results['final_balance'],
                 'total_return': results['total_return'],
-                'sharpe_ratio': 0,  # Можно рассчитать если есть данные о доходности
+                'sharpe_ratio': 0,
                 'max_drawdown': results['max_drawdown'],
                 'win_rate': results['win_rate'],
                 'profit_factor': results['profit_factor'],
@@ -759,7 +824,7 @@ class Backtester:
                 'losing_trades': results['losing_trades'],
                 'avg_win': results['avg_win'],
                 'avg_loss': results['avg_loss'],
-                'details': '{}'  # Можно сохранить детали сделок
+                'details': '{}'
             }
 
             # Сохраняем в базу
@@ -781,12 +846,13 @@ class Backtester:
         """
         try:
             if verbose:
-                print(f"🚀 Запуск бэктеста для {symbol}")
-                print(f"   Начальный баланс: ${initial_balance:,.2f}")
+                print(f"\n🚀 ЗАПУСК КОМПЛЕКСНОГО БЭКТЕСТА")
+                print(f"  📊 Символ: {symbol}")
+                print(f"  💰 Начальный баланс: ${initial_balance:,.2f}")
                 if commission is not None:
-                    print(f"   Комиссия: {commission * 100:.2f}%")
+                    print(f"  📈 Комиссия: {commission * 100:.2f}%")
                 else:
-                    print(f"   Комиссия: {self.commission * 100:.2f}%")
+                    print(f"  📈 Комиссия: {self.commission * 100:.2f}%")
 
             # Устанавливаем комиссию если предоставлена
             if commission is not None:
@@ -794,6 +860,9 @@ class Backtester:
 
             # Получаем даты для бэктеста
             start_date, end_date = self.state_manager.get_backtest_dates()
+
+            if verbose:
+                print(f"  📅 Период: {start_date} - {end_date}")
 
             # Получаем данные для бэктеста
             data = self.db.get_historical_data(
@@ -809,6 +878,9 @@ class Backtester:
                     print("❌ Нет данных для бэктеста")
                 return {'error': 'No data available for backtest'}
 
+            if verbose:
+                print(f"  📊 Загружено данных: {len(data)} строк")
+
             # Получаем модель
             model_info = self.get_best_model(symbol, model_id, verbose=verbose)
 
@@ -819,39 +891,11 @@ class Backtester:
 
             model, scaler = model_info
 
-            if verbose:
-                self.debug_model_features(model, scaler, verbose=verbose)
-
-            model_type = 'unknown'
-
-            # Добавьте:
-            # Явно определяем тип модели
-            if hasattr(model, 'get_booster'):
-                model_type = 'xgb'
-            elif hasattr(model, 'name') and 'lstm' in str(model.name).lower():
-                model_type = 'lstm'
-            elif 'xgb' in str(type(model)).lower():
-                model_type = 'xgb'
-            elif 'lstm' in str(type(model)).lower():
-                model_type = 'lstm'
-            else:
-                # Пытаемся определить по другим признакам
-                try:
-                    import xgboost
-                    if isinstance(model, xgboost.XGBClassifier):
-                        model_type = 'xgb'
-                except:
-                    pass
-
-                try:
-                    import tensorflow as tf
-                    if isinstance(model, tf.keras.Model):
-                        model_type = 'lstm'
-                except:
-                    pass
+            # Определяем тип модели
+            model_type = self.determine_model_type(model, verbose)
 
             if verbose:
-                print(f"  🤖 Окончательно определен тип модели: {model_type}")
+                print(f"  🤖 Тип модели: {model_type.upper()}")
 
             # Подготавливаем данные
             preprocessed_data = self.prepare_backtest_data(
@@ -863,8 +907,11 @@ class Backtester:
                     print("❌ Не удалось подготовить данные для бэктеста")
                 return {'error': 'Failed to prepare data for backtest'}
 
+            if verbose:
+                print(f"  📊 Подготовленные данные: {len(preprocessed_data)} строк")
+
             # Генерируем сигналы
-            signals = self.generate_backtest_signals_simple(
+            signals = self.generate_backtest_signals_optimized(
                 preprocessed_data, model, scaler, model_type, verbose=verbose
             )
 
@@ -886,10 +933,7 @@ class Backtester:
                 self.save_backtest_results(results, symbol, model_id)
 
                 if verbose:
-                    print("✅ Бэктест завершен успешно!")
-                    print(f"   Конечный баланс: ${results['final_balance']:,.2f}")
-                    print(f"   Общая доходность: {results['total_return']:.2f}%")
-                    print(f"   Win Rate: {results['win_rate']:.1f}%")
+                    print("\n✅ БЭКТЕСТ УСПЕШНО ЗАВЕРШЕН!")
 
             return results
 
@@ -901,45 +945,46 @@ class Backtester:
                 traceback.print_exc()
             return {'error': error_msg}
 
-    def get_model_features(self, model: Any, verbose: bool = True) -> List[str]:
+    def determine_model_type(self, model: Any, verbose: bool = True) -> str:
         """
-        Получение фичей из модели
+        Определение типа модели
         """
+        model_type = 'unknown'
+
         try:
-            feature_columns = None
-
-            # Пытаемся получить фичи из атрибутов модели
-            if hasattr(model, 'base_feature_names'):
-                return model.base_feature_names
-            elif hasattr(model, '_features'):
-                return model._features
-            elif hasattr(model, 'feature_names'):
-                # Проверяем, не являются ли это расширенными фичами с лагами
-                feature_names = model.feature_names
-                if isinstance(feature_names, list) and len(feature_names) > 0:
-                    # Если первый фич содержит временной лаг, извлекаем базовые фичи
-                    if any('_t-' in feature for feature in feature_names):
-                        base_features = set()
-                        for feature in feature_names:
-                            if '_t-' in feature:
-                                base_feature = feature.split('_t-')[0]
-                                base_features.add(base_feature)
-                        return list(base_features)
-                    else:
-                        return feature_names
-
-            # Пытаемся получить из метаданных модели
             if hasattr(model, 'get_booster'):
-                booster = model.get_booster()
-                if hasattr(booster, 'feature_names'):
-                    return booster.feature_names
+                model_type = 'xgb'
+            elif hasattr(model, 'name') and 'lstm' in str(model.name).lower():
+                model_type = 'lstm'
+            elif 'xgb' in str(type(model)).lower():
+                model_type = 'xgb'
+            elif 'lstm' in str(type(model)).lower():
+                model_type = 'lstm'
+            else:
+                # Пытаемся определить по другим признакам
+                try:
+                    import xgboost
+                    if isinstance(model, xgboost.XGBClassifier) or isinstance(model, xgboost.XGBRegressor):
+                        model_type = 'xgb'
+                except:
+                    pass
 
-            return None
+                try:
+                    import tensorflow as tf
+                    if isinstance(model, tf.keras.Model):
+                        model_type = 'lstm'
+                except:
+                    pass
+
+            if verbose and model_type == 'unknown':
+                print(f"  ⚠️  Не удалось определить тип модели, используется по умолчанию")
+
+            return model_type
 
         except Exception as e:
             if verbose:
-                print(f"  ⚠️  Ошибка получения фичей из модели: {e}")
-            return None
+                print(f"  ⚠️  Ошибка определения типа модели: {e}")
+            return 'unknown'
 
     def debug_model_features(self, model: Any, scaler: Any, verbose: bool = True):
         """
@@ -979,37 +1024,3 @@ class Backtester:
 
                     if model_features_count != scaler.n_features_in_:
                         print(f"  ❌ НЕСОВПАДЕНИЕ! Модель и скейлер обучены на разном количестве фичей!")
-                        print(f"  ⚠️  Это основная причина ошибки!")
-
-    def debug_data_preparation(self, data: pd.DataFrame, feature_columns: List[str],
-                               lookback_window: int, model_type: str, verbose: bool = True):
-        """
-        Детальная диагностика подготовки данных
-        """
-        if verbose:
-            print(f"\n🔬 ДЕТАЛЬНАЯ ДИАГНОСТИКА ПОДГОТОВКИ ДАННЫХ:")
-            print(f"  📊 Исходные данные: {len(data)} строк, {len(data.columns)} колонок")
-            print(f"  🔍 Используемые фичи: {len(feature_columns)}")
-            print(f"  📐 Lookback window: {lookback_window}")
-            print(f"  🤖 Тип модели: {model_type}")
-
-            # Показываем первые несколько строк с фичами
-            if len(data) > 0 and len(feature_columns) > 0:
-                sample_data = data[feature_columns].head(3)
-                print(f"  📋 Пример данных (первые 3 строки):")
-                for idx, row in sample_data.iterrows():
-                    print(f"    {idx}: {[round(val, 4) for val in row.values[:5]]}...")
-
-            # Для XGBoost показываем ожидаемый формат
-            if 'xgb' in model_type.lower():
-                print(f"\n  🎯 ОЖИДАЕМЫЙ ФОРМАТ ДЛЯ XGBOOST:")
-                print(f"    Входные данные: окно {lookback_window} × {len(feature_columns)} фичей")
-                print(
-                    f"    После flatten: 1 × {lookback_window * len(feature_columns)} = 1 × {lookback_window * len(feature_columns)}")
-
-                # Пример для первой точки
-                if len(data) >= lookback_window:
-                    window_data = data.iloc[:lookback_window][feature_columns]
-                    print(f"\n  📊 ПРИМЕР ПРЕОБРАЗОВАНИЯ:")
-                    print(f"    Окно данных shape: {window_data.shape}")
-                    print(f"    Flattened shape: {window_data.values.flatten().reshape(1, -1).shape}")
