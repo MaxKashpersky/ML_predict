@@ -432,43 +432,31 @@ class DataPreprocessor:
                                         verbose: bool = True) -> np.ndarray:
         """Подготовка фичи для предсказания"""
         try:
-            # КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: используем ТОЧНО ТАКИЕ ЖЕ фичи, как при обучении
-            if hasattr(self, 'last_training_features'):
-                # Используем сохраненные фичи из обучения
-                feature_columns = self.last_training_features
-            else:
-                # Отделяем фичи (старая логика)
-                feature_columns = [col for col in df.columns
-                                   if not col.startswith('TARGET_')
-                                   and col not in ['open', 'high', 'low', 'close', 'volume']]
+            # Для XGBoost используем все фичи кроме целевых и базовых OHLCV
+            feature_columns = [col for col in df.columns
+                               if not col.startswith('TARGET_')
+                               and col not in ['open', 'high', 'low', 'close', 'volume']]
 
             # Оставляем только существующие колонки
             available_features = [col for col in feature_columns if col in df.columns]
-            missing_features = [col for col in feature_columns if col not in df.columns]
 
-            if missing_features:
-                if verbose:
-                    self.log(f"⚠️  Missing {len(missing_features)} features: {missing_features[:10]}", 'warning')
-                    self.log(f"   Available: {len(available_features)} features", 'info')
+            if verbose:
+                print(f"  📊 Используется {len(available_features)} фичей")
 
-                # Создаем недостающие фичи с нулевыми значениями
-                for feature in missing_features:
-                    df[feature] = 0
-
-            X_data = df[feature_columns].values
+            X_data = df[available_features].values
 
             # Берем последние lookback_window значений
             if len(X_data) >= lookback_window:
                 X_sequence = X_data[-lookback_window:].reshape(1, lookback_window, -1)
 
                 if verbose:
-                    self.log(f"Created sequence for prediction: {X_sequence.shape}")
-                    self.log(f"Features used: {len(feature_columns)}")
-                    self.log(f"Expected features for XGBoost: 3300 (55 × 60)")
+                    print(f"  ✅ Создана последовательность для предсказания: {X_sequence.shape}")
+                    print(f"  🔢 Всего фичей: {X_sequence.shape[1] * X_sequence.shape[2]}")
 
                 return X_sequence
             else:
-                self.log(f"Insufficient data for sequence creation", 'warning')
+                if verbose:
+                    print(f"  ❌ Недостаточно данных для создания последовательности")
                 return np.array([])
 
         except Exception as e:
